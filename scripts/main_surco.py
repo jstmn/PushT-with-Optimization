@@ -57,6 +57,7 @@ System design (SurCo-prior):
 
 # --- Example usage
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
+unset LD_LIBRARY_PATH  # < note: this runs things with the gpu. Each iteration is ~1.5x slower though <shrug>
 
 # Random t-pose
 python scripts/main_surco.py --n-envs 64 --random-t-pose
@@ -90,23 +91,21 @@ from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-
-TODO: With a large CONT_OUTPUT_REG_BETA, the contact point should be pushed to the midpoint of the bounds, but that 
-isn't happening.
-
 N_OPT_STEPS = 250
-LR = 0.01
+LR = 0.1
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
 M_ROLLOUTS = 9
 FACE_OUTPUT_REG_BETA = 0.05
-CONT_OUTPUT_REG_BETA = 10
-# CONT_OUTPUT_REG_BETA = 0.1
-# CONT_OUTPUT_REG_BETA = 0.005
+CONTACT_POINT_REG_BETA = 0.1
+ANGLE_REG_BETA = 0.1
+# CONTACT_POINT_REG_BETA = 0.5
+# ANGLE_REG_BETA = 0.5
 CP_TARGET_WEIGHT = 1.0
 ANG_TARGET_WEIGHT = 1.0
 RANDOM_T_POSE_EVAL_EVERY = 25
+BASELINE_EVAL_EVERY = 5
 
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
@@ -125,6 +124,8 @@ _ANG_SCALE = float(ANGLE_BOUNDS[1]) - float(ANGLE_BOUNDS[0])
 _BACKWARD_LOG_DIR: Path | None = None
 _CURRENT_ITERATION: int = -1
 _LAST_GRAD_X: np.ndarray | None = None
+_LAST_BACKWARD_T_GUROBI_MS: float = 0.0
+_LAST_BACKWARD_T_PHYSICS_MS: float = 0.0
 
 
 def _configure_solver(multi_step_n_actions: int | None) -> None:
@@ -158,7 +159,7 @@ def _run_rollout(
     data,
     env: PushTEnv | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Run all action blocks sequentially through step_pure_soft.
+    """Run all action blocks sequentially through step_pure.
 
     Returns (mean_final_dist scalar, t_distances (N, total_steps), jpos_traj (N, total_steps, dofs)).
     Differentiable w.r.t. cp and ang.
@@ -171,9 +172,9 @@ def _run_rollout(
     t_distances_parts = []
     jpos_traj_parts = []
     for action_idx in range(n_actions):
-        rollout_data, _, t_dists, jpos = env.step_pure_soft(
+        rollout_data, _, t_dists, jpos = env.step_pure(
             data=rollout_data,
-            face_weights=face_weights[:, action_idx, :],
+            face=jnp.argmax(face_weights[:, action_idx, :], axis=-1),
             contact_point=cp[:, action_idx],
             angle=ang[:, action_idx],
             n_sim_steps=N_SIM_STEPS,
@@ -248,6 +249,7 @@ def _milp_backward(res, grad_x):
         jax.debug.print("  c={c}", c=c)
 
     # Gurobi pure_callbacks are inherently sequential — loop only for solves.
+    t_gurobi_start = time()
     for k_i in range(M_ROLLOUTS):
         eps_face = jnp.zeros_like(c)
         for action_idx in range(n_actions):
@@ -263,6 +265,7 @@ def _milp_backward(res, grad_x):
         eps_faces.append(eps_face)
         x_ks.append(x_k)
         c_pert_ks.append(c_pert)
+    t_gurobi = time() - t_gurobi_start
 
     # Stack all M face-weight arrays → (M*N, n_actions, F); tile data → (M*N, ...).
     # All M rollouts share the same cp/ang (only face differs), so we tile those too
@@ -277,20 +280,25 @@ def _milp_backward(res, grad_x):
         _, t_dists, _ = _run_rollout(face_weights_all, cp_tiled, ang_tiled, data_tiled, _ENV_BACKWARD)
         # t_dists: (M*N, total_steps) → per-rollout costs (M, N)
         costs_per_env = t_dists[:, -1].reshape(M_ROLLOUTS, n_envs)
-        L_ks = jnp.nanmean(costs_per_env, axis=1)
-        return L_ks.mean(), (L_ks, costs_per_env)
+        mc_rollout_costs_per_perturbation = jnp.nanmean(costs_per_env, axis=1)
+        return mc_rollout_costs_per_perturbation.mean(), (mc_rollout_costs_per_perturbation, costs_per_env)
 
-    # One parallel backward pass: L_ks for MC face estimator, grads for continuous.
-    (_, (L_ks, costs_per_env_all)), (grad_cp_0, grad_ang_0) = jax.value_and_grad(
+    # One parallel backward pass: mc_rollout_costs_per_perturbation for MC face estimator, grads for continuous.
+    t_physics_start = time()
+    (_, (mc_rollout_costs_per_perturbation, costs_per_env_all)), (grad_cp_0, grad_ang_0) = jax.value_and_grad(
         all_rollouts_cost, argnums=(0, 1), has_aux=True
     )(cp_0, ang_0)
+    t_physics = time() - t_physics_start
+    global _LAST_BACKWARD_T_GUROBI_MS, _LAST_BACKWARD_T_PHYSICS_MS
+    _LAST_BACKWARD_T_GUROBI_MS = t_gurobi * 1000
+    _LAST_BACKWARD_T_PHYSICS_MS = t_physics * 1000
     # grad_cp_0 = (1/M) Σ_k ∂L_k/∂cp  (chain rule through jnp.repeat averages over M)
 
     # Face MC gradient — mean-baseline control variate reduces variance.
-    L_mean = L_ks.mean()
+    mc_rollout_cost_mean = mc_rollout_costs_per_perturbation.mean()
     grad_c_face = jnp.zeros_like(c)
     for k_i in range(M_ROLLOUTS):
-        grad_c_face = grad_c_face + eps_faces[k_i] * (L_ks[k_i] - L_mean)
+        grad_c_face = grad_c_face + eps_faces[k_i] * (mc_rollout_costs_per_perturbation[k_i] - mc_rollout_cost_mean)
     grad_c_face = grad_c_face / (M_ROLLOUTS * PERTURB_LAMBDA)
 
     # Continuous gradient: map (N, n_actions) grad arrays back into the c layout.
@@ -301,7 +309,12 @@ def _milp_backward(res, grad_x):
         grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES + 1].set(grad_ang_0[:, action_idx])
 
     if verbosity > 0:
-        jax.debug.print("  L_mean={L_mean}", L_mean=L_mean)
+        jax.debug.print("  mc_rollout_cost_mean={mc_rollout_cost_mean}", mc_rollout_cost_mean=mc_rollout_cost_mean)
+    cprint(
+        f"  [backward]  gurobi ({M_ROLLOUTS} solves): {t_gurobi*1000:.0f} ms  |  "
+        f"physics rollouts + grad: {t_physics*1000:.0f} ms",
+        "white",
+    )
 
     grad_c = grad_c_face + grad_c_continuous
 
@@ -317,7 +330,7 @@ def _milp_backward(res, grad_x):
             x_perturbed=np.stack([np.asarray(xk) for xk in x_ks], axis=0),      # (M, N, D)
             c_perturbed=np.stack([np.asarray(ck) for ck in c_pert_ks], axis=0), # (M, N, D)
             costs_per_env=np.asarray(costs_per_env_all),                         # (M, N)
-            L_ks=np.asarray(L_ks),                                               # (M,)
+            mc_rollout_costs_per_perturbation=np.asarray(mc_rollout_costs_per_perturbation),                                               # (M,)
             grad_c=np.asarray(grad_c),
             grad_c_face=np.asarray(grad_c_face),
             grad_c_continuous=np.asarray(grad_c_continuous),
@@ -344,6 +357,7 @@ def plot_results(
     relative_coordinates: bool = False,
     random_means=None,
     random_stds=None,
+    baseline_iters=None,
     save_filepath=None,
     save_filepath2=None,
     open_after_save=False,
@@ -371,10 +385,11 @@ def plot_results(
     ax_mean.grid(True, alpha=0.3)
 
     if has_random_baseline:
+        bx = np.asarray(baseline_iters) if baseline_iters is not None else np.arange(len(random_means))
         ax_std.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-        ax_std.plot(x_iters, random_means, label="mean % vs baseline", color="tab:green")
+        ax_std.plot(bx, random_means, label="mean % vs baseline", color="tab:green")
         ax_std.fill_between(
-            x_iters,
+            bx,
             np.asarray(random_means) - np.asarray(random_stds),
             np.asarray(random_means) + np.asarray(random_stds),
             color="tab:green",
@@ -561,7 +576,9 @@ def main(
                 m_rollouts=M_ROLLOUTS,
                 perturb_lambda=PERTURB_LAMBDA,
                 face_output_reg_beta=FACE_OUTPUT_REG_BETA,
-                cont_output_reg_beta=CONT_OUTPUT_REG_BETA,
+                contact_point_reg_beta=CONTACT_POINT_REG_BETA,
+                angle_reg_beta=ANGLE_REG_BETA,
+                baseline_eval_every=BASELINE_EVAL_EVERY,
                 num_faces=NUM_FACES,
                 problem_type=problem_type,
                 n_actions=n_actions,
@@ -614,8 +631,8 @@ def main(
         c_cp = c_blocks[:, :, NUM_FACES]
         c_angle = c_blocks[:, :, NUM_FACES + 1]
         face_logit_regularization = FACE_OUTPUT_REG_BETA * jnp.mean(jnp.square(c_blocks[:, :, :NUM_FACES]))
-        cp_regularization = CONT_OUTPUT_REG_BETA * jnp.mean(jnp.square((c_cp - _CP_MID) / _CP_SCALE))
-        angle_regularization = CONT_OUTPUT_REG_BETA * jnp.mean(jnp.square((c_angle - _ANG_MID) / _ANG_SCALE))
+        cp_regularization = CONTACT_POINT_REG_BETA * jnp.mean(jnp.square((c_cp - _CP_MID) / _CP_SCALE))
+        angle_regularization = ANGLE_REG_BETA * jnp.mean(jnp.square((c_angle - _ANG_MID) / _ANG_SCALE))
         loss = task_loss + face_logit_regularization + cp_regularization + angle_regularization
 
         if log_forward and verbosity > 0:
@@ -661,6 +678,7 @@ def main(
     stds = []
     random_means = []
     random_stds = []
+    baseline_iters = []  # iteration indices where baseline was evaluated
     dist_delta_hist = []  # list of (n_envs,) float — change in final distance from iter 1 per env
     face_hist = []  # list of (n_envs,) int — argmax face per env per iter
     cp_hist = []  # list of (n_envs,) float — contact_point per env per iter
@@ -691,11 +709,24 @@ def main(
             env.reset(seed=RESET_SEED)
 
         t0 = time()
+
         env_data_0 = env.data
         step_key = jax.random.PRNGKey(it)
         (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch, task_loss, face_logit_regularization, cp_regularization, angle_regularization)), g_raw = cost_and_grad(
             params, env_data_0, step_key
         )
+        t_forward_backward = time() - t0
+
+        t1 = time()
+        grad_c = np.asarray(grad_loss_wrt_c(c_batch, env_data_0, step_key))
+        t_grad_c = time() - t1
+
+        t2 = time()
+        g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
+        updates, opt_state = optimizer.update(g_params, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        t_optimizer = time() - t2
+
         final_dists_np = np.asarray(t_distances[:, -1])
         initial_dists_np = np.asarray(t_distances[:, 0])
         mean_dist = float(np.nanmean(final_dists_np))
@@ -703,10 +734,6 @@ def main(
         face_hist_current = face_idx_np[:, 0] if is_multi_step else face_idx_np
         cp_hist_current = np.asarray(cp_batch[:, 0] if is_multi_step else cp_batch)
         ang_hist_current = np.asarray(ang_batch[:, 0] if is_multi_step else ang_batch)
-        grad_c = np.asarray(grad_loss_wrt_c(c_batch, env_data_0, step_key))
-        g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
-        updates, opt_state = optimizer.update(g_params, opt_state, params)
-        params = optax.apply_updates(params, updates)
         dt = time() - t0
         x_batch = np.concatenate(
             [
@@ -765,27 +792,30 @@ def main(
         baseline_means_np = None
         pct_vs_baseline = None
         mean_pct_vs_baseline = None
-        if not disable_random:
+        t_baseline = 0.0
+        is_baseline_step = (it % BASELINE_EVAL_EVERY) == 0
+        if not disable_random and is_baseline_step:
             assert baseline_env is not None
+            t3 = time()
             baseline_means_np, _ = center_action_baseline(
                 baseline_env,
                 target_poses=env.target_poses,
                 t_poses=env.t_poses,
             )
+            t_baseline = time() - t3
             pct_vs_baseline = 100.0 * (final_dists_np - baseline_means_np) / np.maximum(baseline_means_np, 1e-8)
             mean_pct_vs_baseline = float(np.nanmean(pct_vs_baseline))
-            cprint(
-                f"|____ baseline mean per env:  {np.round(baseline_means_np, 5).tolist()}",
-                "cyan",
-            )
-            cprint(
-                f"|____ % vs baseline per env:  {np.round(pct_vs_baseline, 3).tolist()}",
-                "cyan" if mean_pct_vs_baseline < 0 else "yellow",
-            )
-            cprint(
-                f"|____ mean % vs baseline: {mean_pct_vs_baseline:.4f}%",
-                "green" if mean_pct_vs_baseline < 0 else "red",
-            )
+            print(f"|____ baseline mean per env:  {np.round(baseline_means_np, 5).tolist()}")
+            print(f"|____ % vs baseline per env:  {np.round(pct_vs_baseline, 3).tolist()}")
+            print(f"|____ mean % vs baseline: {mean_pct_vs_baseline:.4f}%")
+        cprint(
+            f"|____ timing  fwd+bwd: {t_forward_backward*1000:.0f} ms  "
+            f"grad_c: {t_grad_c*1000:.0f} ms  "
+            f"optimizer: {t_optimizer*1000:.0f} ms  "
+            f"baseline: {t_baseline*1000:.0f} ms  "
+            f"total: {dt*1000:.0f} ms",
+            "white",
+        )
         save_json(
             iterations_dir / f"{it:03d}.json",
             it,
@@ -820,7 +850,14 @@ def main(
                 "std_final_dist": float(np.nanstd(final_dists_np)),
                 "n_nan_envs": len(nan_envs),
                 "n_bad_grads": n_bad_grads,
-                "iter_time_ms": dt * 1000,
+                "time/iterations_per_second": 1.0 / dt,
+                "time/time_per_iteration_ms": dt * 1000,
+                "time/forward_backward_ms": t_forward_backward * 1000,
+                "time/backward_gurobi_ms": _LAST_BACKWARD_T_GUROBI_MS,
+                "time/backward_physics_ms": _LAST_BACKWARD_T_PHYSICS_MS,
+                "time/grad_c_ms": t_grad_c * 1000,
+                "time/optimizer_ms": t_optimizer * 1000,
+                "time/baseline_ms": t_baseline * 1000,
                 "n_envs_better": int(n_envs_better),
             }
             if mean_pct_vs_baseline is not None and pct_vs_baseline is not None:
@@ -830,6 +867,13 @@ def main(
                 wandb_payload["max_grad"] = max_grad
                 wandb_payload["mean_grad"] = mean_grad
             wandb.log(wandb_payload, step=it)
+            action_log = {}
+            for env_i in range(min(n_envs, 4)):
+                face_i = int(face_hist_current[env_i]) if is_multi_step else int(face_idx_np[env_i])
+                action_log[f"action/face_env_{env_i}"] = face_i
+                action_log[f"action/contact_point_env_{env_i}"] = float(cp_hist_current[env_i])
+                action_log[f"action/angle_env_{env_i}"] = float(ang_hist_current[env_i])
+            wandb.log(action_log, step=it)
             if n_envs == 1:
                 c0 = np.asarray(c_batch)[0]
                 dc0 = np.asarray(grad_c)[0]
@@ -848,6 +892,7 @@ def main(
         if mean_pct_vs_baseline is not None and pct_vs_baseline is not None:
             random_means.append(mean_pct_vs_baseline)
             random_stds.append(float(np.nanstd(pct_vs_baseline)))
+            baseline_iters.append(it)
         dist_delta_hist.append(final_dists_np - initial_final_dists)
         face_hist.append(face_hist_current)
         cp_hist.append(cp_hist_current)
@@ -874,6 +919,7 @@ def main(
                 relative_coordinates=relative_coordinates,
                 random_means=random_means if random_means else None,
                 random_stds=random_stds if random_stds else None,
+                baseline_iters=baseline_iters if baseline_iters else None,
                 save_filepath=save_dir / f"{it + 1:03d}.png",
                 save_filepath2=save_dir / f"latest.png",
                 open_after_save=False,
@@ -922,6 +968,7 @@ def main(
         relative_coordinates=relative_coordinates,
         random_means=random_means if random_means else None,
         random_stds=random_stds if random_stds else None,
+        baseline_iters=baseline_iters if baseline_iters else None,
         open_after_save=True,
     )
 
