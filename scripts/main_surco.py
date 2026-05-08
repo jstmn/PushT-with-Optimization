@@ -98,8 +98,10 @@ RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
 M_ROLLOUTS = 9
 FACE_OUTPUT_REG_BETA = 0.05
-CONTACT_POINT_REG_BETA = 0.1
-ANGLE_REG_BETA = 0.1
+CONTACT_POINT_REG_BETA = 0.01
+ANGLE_REG_BETA = 0.01
+# CONTACT_POINT_REG_BETA = 0.1
+# ANGLE_REG_BETA = 0.1
 # CONTACT_POINT_REG_BETA = 0.5
 # ANGLE_REG_BETA = 0.5
 CP_TARGET_WEIGHT = 1.0
@@ -258,6 +260,10 @@ def _milp_backward(res, grad_x):
             eps_face = eps_face.at[:, lo : lo + NUM_FACES].set(
                 jax.random.normal(subkey, (n_envs, NUM_FACES), dtype=jnp.float32)
             )
+            key, subkey = jax.random.split(key)
+            eps_face = eps_face.at[:, lo + NUM_FACES : lo + NUM_FACES + 2].set(
+                0.1 * jax.random.normal(subkey, (n_envs, 2), dtype=jnp.float32)
+            )
         c_pert = (c + PERTURB_LAMBDA * eps_face).astype(jnp.float32)
         x_k = _solve_milp_pure_callback(c_pert)
         x_k_blocks = x_k.reshape(n_envs, n_actions, ACTION_DIM)
@@ -302,11 +308,13 @@ def _milp_backward(res, grad_x):
     grad_c_face = grad_c_face / (M_ROLLOUTS * PERTURB_LAMBDA)
 
     # Continuous gradient: map (N, n_actions) grad arrays back into the c layout.
-    grad_c_continuous = jnp.zeros_like(c)
-    for action_idx in range(n_actions):
-        lo = action_idx * ACTION_DIM
-        grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES].set(grad_cp_0[:, action_idx])
-        grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES + 1].set(grad_ang_0[:, action_idx])
+    # grad_c_continuous = jnp.zeros_like(c)
+    # for action_idx in range(n_actions):
+    #     lo = action_idx * ACTION_DIM
+    #     grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES].set(grad_cp_0[:, action_idx])
+    #     grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES + 1].set(grad_ang_0[:, action_idx])
+    # grad_c = grad_c_face + grad_c_continuous
+    grad_c = grad_c_face
 
     if verbosity > 0:
         jax.debug.print("  mc_rollout_cost_mean={mc_rollout_cost_mean}", mc_rollout_cost_mean=mc_rollout_cost_mean)
@@ -316,7 +324,6 @@ def _milp_backward(res, grad_x):
         "white",
     )
 
-    grad_c = grad_c_face + grad_c_continuous
 
     global _LAST_GRAD_X
     _LAST_GRAD_X = np.asarray(grad_x)
@@ -333,7 +340,7 @@ def _milp_backward(res, grad_x):
             mc_rollout_costs_per_perturbation=np.asarray(mc_rollout_costs_per_perturbation),                                               # (M,)
             grad_c=np.asarray(grad_c),
             grad_c_face=np.asarray(grad_c_face),
-            grad_c_continuous=np.asarray(grad_c_continuous),
+            # grad_c_continuous=np.asarray(grad_c_continuous),
         )
 
     return (grad_c, None, None, None)
@@ -704,8 +711,14 @@ def main(
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
     # solve, so a JIT wrapper adds overhead without benefit. Physics is already
     # JIT'd internally.
-    cost_and_grad = jax.value_and_grad(cost, argnums=0, has_aux=True)
-    grad_loss_wrt_c = jax.grad(lambda c, data, rng_solve: cost_from_c(c, data, rng_solve, 0, False)[0], argnums=0)
+    # Training step: computes loss + gradient of loss w.r.t. MLP params.
+    # The grad flows: loss → x_star → c → params (via Gurobi VJP + autograd through MLP).
+    loss_and_grad_wrt_params = jax.value_and_grad(cost, argnums=0, has_aux=True)
+
+    # Logging only: computes gradient of loss w.r.t. c (the NN output / Gurobi input).
+    # This is NOT used for training — it lets us inspect what signal is arriving at c
+    # before it flows back through the MLP, useful for debugging the Gurobi VJP.
+    # grad_wrt_c = jax.grad(lambda c, data, rng_solve: cost_from_c(c, data, rng_solve, 0, False)[0], argnums=0)
 
     print("SurCo-prior: training NN  y → solver params  (Gurobi + randomized-smoothing VJP)")
     if n_envs < 16:
@@ -777,14 +790,14 @@ def main(
                 cprint(f"[CHECK OK] _xy_centers differ: env0={xy[0]}  env1={xy[1]}", "green")
 
         step_key = jax.random.PRNGKey(it)
-        (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch, task_loss, face_logit_regularization, cp_regularization, angle_regularization)), g_raw = cost_and_grad(
+        (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch, task_loss, face_logit_regularization, cp_regularization, angle_regularization)), g_raw = loss_and_grad_wrt_params(
             params, env_data_0, step_key
         )
         t_forward_backward = time() - t0
 
-        t1 = time()
-        grad_c = np.asarray(grad_loss_wrt_c(c_batch, env_data_0, step_key))
-        t_grad_c = time() - t1
+        # t1 = time()
+        # grad_c = np.asarray(grad_wrt_c(c_batch, env_data_0, step_key))
+        # t_grad_c = time() - t1
 
         t2 = time()
         g_params = jax.tree.map(lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), g_raw)
@@ -853,7 +866,7 @@ def main(
         cprint(f"|____ contact-point={cp_hist_current.tolist()}", "yellow")
         if verbosity > 1:
             cprint(f"|____ c=           {np.asarray(c_batch).tolist()}", "yellow")
-            cprint(f"|____ dloss/dc=    {grad_c.tolist()}", "yellow")
+            # cprint(f"|____ dloss/dc=    {grad_c.tolist()}", "yellow")
         baseline_means_np = None
         pct_vs_baseline = None
         mean_pct_vs_baseline = None
@@ -875,7 +888,7 @@ def main(
             print(f"|____ mean % vs baseline: {mean_pct_vs_baseline:.4f}%")
         cprint(
             f"|____ timing  fwd+bwd: {t_forward_backward*1000:.0f} ms  "
-            f"grad_c: {t_grad_c*1000:.0f} ms  "
+            # f"grad_c: {t_grad_c*1000:.0f} ms  "
             f"optimizer: {t_optimizer*1000:.0f} ms  "
             f"baseline: {t_baseline*1000:.0f} ms  "
             f"total: {dt*1000:.0f} ms",
@@ -889,7 +902,7 @@ def main(
             final_dists_np,
             c_batch,
             x_batch,
-            grad_c,
+            # grad_c,
             baseline_means_np,
             pct_vs_baseline,
             grad_x=_LAST_GRAD_X,
@@ -920,7 +933,7 @@ def main(
                 "time/forward_backward_ms": t_forward_backward * 1000,
                 "time/backward_gurobi_ms": _LAST_BACKWARD_T_GUROBI_MS,
                 "time/backward_physics_ms": _LAST_BACKWARD_T_PHYSICS_MS,
-                "time/grad_c_ms": t_grad_c * 1000,
+                # "time/grad_c_ms": t_grad_c * 1000,
                 "time/optimizer_ms": t_optimizer * 1000,
                 "time/baseline_ms": t_baseline * 1000,
                 "n_envs_better": int(n_envs_better),
@@ -940,14 +953,15 @@ def main(
                 action_log[f"action/angle_env_{env_i}"] = float(ang_hist_current[env_i])
             wandb.log(action_log, step=it)
             c0 = np.asarray(c_batch)[0]
-            dc0 = np.asarray(grad_c)[0]
+            # dc0 = np.asarray(grad_c)[0]
             c_log = {f"c/face_{fi}": float(c0[fi]) for fi in range(NUM_FACES)}
             c_log["c/contact_point"] = float(c0[NUM_FACES])
             c_log["c/angle"] = float(c0[NUM_FACES + 1])
-            dc_log = {f"dc/face_{fi}": float(dc0[fi]) for fi in range(NUM_FACES)}
-            dc_log["dc/contact_point"] = float(dc0[NUM_FACES])
-            dc_log["dc/angle"] = float(dc0[NUM_FACES + 1])
-            wandb.log({**c_log, **dc_log}, step=it)
+            wandb.log(c_log, step=it)
+            # dc_log = {f"dc/face_{fi}": float(dc0[fi]) for fi in range(NUM_FACES)}
+            # dc_log["dc/contact_point"] = float(dc0[NUM_FACES])
+            # dc_log["dc/angle"] = float(dc0[NUM_FACES + 1])
+            # wandb.log({**c_log, **dc_log}, step=it)
 
         # Log results for plotting
         #
