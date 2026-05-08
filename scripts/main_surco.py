@@ -63,7 +63,7 @@ unset LD_LIBRARY_PATH  # < note: this runs things with the gpu. Each iteration i
 python scripts/main_surco.py --n-envs 64 --random-t-pose
 python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --random-t-pose --record-video
 
-python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 4 --relative-coordinates --verbosity 1 --record-video
 """
 
 from __future__ import annotations
@@ -596,9 +596,26 @@ def main(
     opt_state = optimizer.init(params)
 
     def cost_from_c(c, data, rng_solve, solver_verbosity: int, log_forward: bool):
+        if n_envs > 1:
+            def _check_c(c_np):
+                if np.all(c_np[0] == c_np[1]):
+                    print(f"[CHECK FAIL] c is identical across envs: {c_np[0]}")
+                else:
+                    print(f"[CHECK OK] c differs:  env0={c_np[0]}  env1={c_np[1]}")
+            jax.debug.callback(_check_c, c)
+
         # Do one clean forward solve/rollout. The M_ROLLOUTS Monte Carlo rollouts
         # used for gradient estimation live in milp_solver's custom VJP.
         x_star = milp_solver(c, data, rng_solve, solver_verbosity)  # (n_envs, action_dim)
+
+        if n_envs > 1:
+            def _check_x_star(x_np):
+                if np.all(x_np[0] == x_np[1]):
+                    print(f"[CHECK FAIL] x_star is identical across envs: {x_np[0]}")
+                else:
+                    print(f"[CHECK OK] x_star differs: env0={x_np[0]}  env1={x_np[1]}")
+            jax.debug.callback(_check_x_star, x_star)
+
         x_star_blocks = x_star.reshape((x_star.shape[0], n_actions, ACTION_DIM))
         c_blocks = c.reshape((c.shape[0], n_actions, ACTION_DIM))
         face_weights = x_star_blocks[:, :, :NUM_FACES]
@@ -650,7 +667,28 @@ def main(
 
     def cost(params, data, rng_solve):
         ctx = env.get_context_vector(data)  # (n_envs, 9)
+
+        if n_envs > 1:
+            def _assert_ctx_differ(ctx_np):
+                # [target_x, target_y, target_theta, rel_x, rel_y, rel_theta, rel_vx, rel_vy, vtheta]
+                ctx1 = ctx_np[0, 0:6]
+                ctx2 = ctx_np[1, 0:6]
+                min_diff = np.min(np.abs(ctx1 - ctx2))
+                assert min_diff > 1e-6, (
+                    f"Context vectors for env 0 and env 1 are identical:\n{ctx1}\n{ctx2}\nThis means "
+                    f"the env reset produced the same poses for all environments."
+                )
+            jax.debug.callback(_assert_ctx_differ, ctx)
+
         c = mlp.apply(params, ctx)  # (n_envs, action_dim)
+
+        # if n_envs > 1:
+        #     def _assert_c_differ(c_np):
+        #         assert not np.all(c_np[0] == c_np[1]), (
+        #             f"NN outputs c for env 0 and env 1 are identical:\n{c_np[0]}\nContext vectors "
+        #             f"may be different but MLP weights are producing the same output."
+        #         )
+        #     jax.debug.callback(_assert_c_differ, c)
 
         if verbosity > 1:
             jax.debug.print(
@@ -659,6 +697,8 @@ def main(
                 lo=ctx.min(),
                 hi=ctx.max(),
             )
+        if verbosity > 0:
+            jax.debug.print("ctx[0]={c0}  ctx[1]={c1}", c0=ctx[0], c1=ctx[1] if n_envs > 1 else ctx[0])
         return cost_from_c(c, data, rng_solve, verbosity, True)
 
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
@@ -711,6 +751,31 @@ def main(
         t0 = time()
 
         env_data_0 = env.data
+
+        if n_envs > 1:
+            jp = np.asarray(env_data_0.joint_positions)
+            if np.all(jp[0] == jp[1]):
+                cprint(f"[CHECK FAIL] joint_positions identical across envs", "red")
+            else:
+                cprint(f"[CHECK OK] joint_positions differ across envs", "green")
+
+            t_poses_np = env.t_poses
+            tgt_poses_np = env.target_poses
+            if np.all(t_poses_np[0] == t_poses_np[1]):
+                cprint(f"[CHECK FAIL] t_poses identical: {t_poses_np}", "red")
+            else:
+                cprint(f"[CHECK OK] t_poses differ:  env0={t_poses_np[0]}  env1={t_poses_np[1]}", "green")
+            if np.all(tgt_poses_np[0] == tgt_poses_np[1]):
+                cprint(f"[CHECK FAIL] target_poses identical: {tgt_poses_np}", "red")
+            else:
+                cprint(f"[CHECK OK] target_poses differ: env0={tgt_poses_np[0]}  env1={tgt_poses_np[1]}", "green")
+
+            xy = env._xy_centers
+            if np.all(xy[0] == xy[1]):
+                cprint(f"[CHECK FAIL] _xy_centers identical: {xy}", "red")
+            else:
+                cprint(f"[CHECK OK] _xy_centers differ: env0={xy[0]}  env1={xy[1]}", "green")
+
         step_key = jax.random.PRNGKey(it)
         (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch, task_loss, face_logit_regularization, cp_regularization, angle_regularization)), g_raw = cost_and_grad(
             params, env_data_0, step_key
@@ -874,16 +939,15 @@ def main(
                 action_log[f"action/contact_point_env_{env_i}"] = float(cp_hist_current[env_i])
                 action_log[f"action/angle_env_{env_i}"] = float(ang_hist_current[env_i])
             wandb.log(action_log, step=it)
-            if n_envs == 1:
-                c0 = np.asarray(c_batch)[0]
-                dc0 = np.asarray(grad_c)[0]
-                c_log = {f"c/face_{fi}": float(c0[fi]) for fi in range(NUM_FACES)}
-                c_log["c/contact_point"] = float(c0[NUM_FACES])
-                c_log["c/angle"] = float(c0[NUM_FACES + 1])
-                dc_log = {f"dc/face_{fi}": float(dc0[fi]) for fi in range(NUM_FACES)}
-                dc_log["dc/contact_point"] = float(dc0[NUM_FACES])
-                dc_log["dc/angle"] = float(dc0[NUM_FACES + 1])
-                wandb.log({**c_log, **dc_log}, step=it)
+            c0 = np.asarray(c_batch)[0]
+            dc0 = np.asarray(grad_c)[0]
+            c_log = {f"c/face_{fi}": float(c0[fi]) for fi in range(NUM_FACES)}
+            c_log["c/contact_point"] = float(c0[NUM_FACES])
+            c_log["c/angle"] = float(c0[NUM_FACES + 1])
+            dc_log = {f"dc/face_{fi}": float(dc0[fi]) for fi in range(NUM_FACES)}
+            dc_log["dc/contact_point"] = float(dc0[NUM_FACES])
+            dc_log["dc/angle"] = float(dc0[NUM_FACES + 1])
+            wandb.log({**c_log, **dc_log}, step=it)
 
         # Log results for plotting
         #

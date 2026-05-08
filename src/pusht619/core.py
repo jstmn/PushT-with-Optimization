@@ -12,6 +12,7 @@ from pathlib import Path
 import copy
 from dataclasses import dataclass
 import functools
+import math
 from typing import Any
 
 import numpy as np
@@ -773,14 +774,14 @@ class PushTEnv:
             )
         )(jnp.vstack(subkeys))
 
-        row_length = int(jnp.sqrt(nenvs))
+        row_length = math.ceil(math.sqrt(nenvs))
         spacing = max(WORKSPACE_WIDTH, WORKSPACE_HEIGHT) * 1.2
         row_dist = spacing * (row_length - 1) / 2
         x, y = jnp.meshgrid(
             jnp.linspace(-row_dist, row_dist, num=row_length) if row_length > 1 else jnp.array([0.0]),
             jnp.linspace(-row_dist, row_dist, num=row_length) if row_length > 1 else jnp.array([0.0]),
         )
-        xy_coordinate = jnp.stack([x.flatten(), y.flatten()], axis=-1)
+        xy_coordinate = jnp.stack([x.flatten(), y.flatten()], axis=-1)[:nenvs]
         self._xy_centers = np.array(xy_coordinate)
         self._data = data_batch_t0.replace(
             model=self._model,
