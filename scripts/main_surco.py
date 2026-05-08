@@ -60,10 +60,12 @@ System design (SurCo-prior):
 unset LD_LIBRARY_PATH  # < note: this runs things with the gpu. Each iteration is ~1.5x slower though <shrug>
 
 # Random t-pose
-python scripts/main_surco.py --n-envs 64 --random-t-pose
 python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --random-t-pose --record-video
 
+python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --record-video
 python scripts/main_surco.py --n-envs 4 --relative-coordinates --verbosity 1 --record-video
+python scripts/main_surco.py --n-envs 4 --relative-coordinates --verbosity 1 --random-t-pose
+python scripts/main_surco.py --n-envs 64 --relative-coordinates --verbosity 1 --random-t-pose
 """
 
 from __future__ import annotations
@@ -85,8 +87,52 @@ import jax.numpy as jnp
 import numpy as np
 import argparse
 import optax
-from pusht619.models import MLP, ActionSolver, ActionSolverMultiStep
+import flax.linen as nn
+import flax.traverse_util
+from pusht619.models import ActionSolver, ActionSolverMultiStep
 from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES
+from pusht619.plotting_utils import plot_results, plot_perturbation_hist
+
+_CP_LO, _CP_HI = CONTACT_POINT_BOUNDS
+_ANG_LO, _ANG_HI = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
+
+
+class SurCoMLP(nn.Module):
+    """Maps context y → solver parameters c (face logits + bounded cp/angle targets).
+
+    Output blocks of size (NUM_FACES + 2):
+      [:NUM_FACES]  face logits (unbounded, fed to Gurobi as linear costs)
+      [NUM_FACES]   contact_point target, tanh-squashed into CONTACT_POINT_BOUNDS
+      [NUM_FACES+1] angle target, tanh-squashed into ANGLE_BOUNDS
+    """
+    hidden_dims: tuple
+    output_dim: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        for dim in self.hidden_dims:
+            x = nn.Dense(dim)(x)
+            x = nn.relu(x)
+        x = nn.Dense(self.output_dim)(x)
+        x = x.reshape(x.shape[0], -1, NUM_FACES + 2)
+        return x.reshape(x.shape[0], -1)
+        # face_logits = x[:, :, :NUM_FACES]
+        # cp_mid = 0.5 * (_CP_LO + _CP_HI)
+        # cp_half = 0.5 * (_CP_HI - _CP_LO)
+        # ang_mid = 0.5 * (_ANG_LO + _ANG_HI)
+        # ang_half = 0.5 * (_ANG_HI - _ANG_LO)
+        # cp_target = cp_mid + cp_half * jnp.tanh(x[:, :, NUM_FACES : NUM_FACES + 1])
+        # ang_target = ang_mid + ang_half * jnp.tanh(x[:, :, NUM_FACES + 1 : NUM_FACES + 2])
+        # cp_target = x[:, :, NUM_FACES : NUM_FACES + 1]
+        # ang_target = x[:, :, NUM_FACES + 1 : NUM_FACES + 2]
+        # out = jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
+        # return out.reshape(out.shape[0], -1)
+
+
+def save_mlp_weights(filepath: Path, params) -> None:
+    flat = flax.traverse_util.flatten_dict(params, sep="/")
+    np.savez(filepath, **{k: np.asarray(v) for k, v in flat.items()})
+
 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
@@ -98,8 +144,8 @@ RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
 M_ROLLOUTS = 9
 FACE_OUTPUT_REG_BETA = 0.05
-CONTACT_POINT_REG_BETA = 0.01
-ANGLE_REG_BETA = 0.01
+CONTACT_POINT_REG_BETA = 0.1
+ANGLE_REG_BETA = 0.1
 # CONTACT_POINT_REG_BETA = 0.1
 # ANGLE_REG_BETA = 0.1
 # CONTACT_POINT_REG_BETA = 0.5
@@ -343,134 +389,16 @@ def _milp_backward(res, grad_x):
             # grad_c_continuous=np.asarray(grad_c_continuous),
         )
 
+    if wandb.run is not None and _CURRENT_ITERATION >= 0 and (_CURRENT_ITERATION % BASELINE_EVAL_EVERY) == 0:
+        fig = plot_perturbation_hist(c, c_pert_ks, x_ks, x_star, n_envs, _CURRENT_ITERATION)
+        wandb.log({"c_figures/perturbation_hist": wandb.Image(fig)}, step=_CURRENT_ITERATION)
+        plt.close(fig)
+
     return (grad_c, None, None, None)
 
 
 milp_solver.defvjp(_milp_forward, _milp_backward)
 
-
-def plot_results(
-    save_dir,
-    means,
-    stds,
-    dist_delta_hist,
-    face_hist,
-    cp_hist,
-    ang_hist,
-    n_envs,
-    n_sim_steps,
-    n_opt_steps,
-    random_t_pose,
-    relative_coordinates: bool = False,
-    random_means=None,
-    random_stds=None,
-    baseline_iters=None,
-    save_filepath=None,
-    save_filepath2=None,
-    open_after_save=False,
-):
-    initial_mean_loss = means[0]
-    x_iters = np.arange(len(means))
-    has_random_baseline = random_means is not None and random_stds is not None
-    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
-    fig.suptitle(
-        f"SurCo-prior  n_envs={n_envs}  n_sim_steps={n_sim_steps}  "
-        f"n_opt_steps={n_opt_steps}  M={M_ROLLOUTS}  λ={PERTURB_LAMBDA}  "
-        f"RANDOM_T_POSE={random_t_pose}  RELATIVE_COORDINATES={relative_coordinates}",
-        fontweight="bold",
-    )
-    ax_mean, ax_std = axes[0, 0], axes[0, 1]
-    ax_cp, ax_ang = axes[1, 0], axes[1, 1]
-    ax_face, ax_delta = axes[2, 0], axes[2, 1]
-
-    ax_mean.axhline(float(initial_mean_loss), label="initial mean", color="black", linestyle="--")
-    ax_mean.plot(x_iters, means, label="training mean", color="tab:red")
-    ax_mean.legend()
-    ax_mean.set_title("Mean Final Distance")
-    ax_mean.set_xlabel("Iteration")
-    ax_mean.set_ylabel("Distance [m]")
-    ax_mean.grid(True, alpha=0.3)
-
-    if has_random_baseline:
-        bx = np.asarray(baseline_iters) if baseline_iters is not None else np.arange(len(random_means))
-        ax_std.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-        ax_std.plot(bx, random_means, label="mean % vs baseline", color="tab:green")
-        ax_std.fill_between(
-            bx,
-            np.asarray(random_means) - np.asarray(random_stds),
-            np.asarray(random_means) + np.asarray(random_stds),
-            color="tab:green",
-            alpha=0.2,
-            label="± std across envs",
-        )
-        ax_std.legend()
-        ax_std.set_title("% vs Center-Action Baseline")
-        ax_std.set_xlabel("Iteration")
-        ax_std.set_ylabel("% change (negative = better)")
-    else:
-        ax_std.plot(x_iters, stds, label="training std", color="tab:red")
-        ax_std.legend()
-        ax_std.set_title("Final Distance Std")
-        ax_std.set_xlabel("Iteration")
-        ax_std.set_ylabel("Std [m]")
-    ax_std.grid(True, alpha=0.3)
-
-    mean_delta = [float(np.nanmean(delta)) for delta in dist_delta_hist]
-    ax_delta.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-    ax_delta.plot(mean_delta, color="black", linewidth=2.0, label="mean")
-    for env_idx in range(min(n_envs, 7)):
-        ax_delta.plot([delta[env_idx] for delta in dist_delta_hist], label=f"env {env_idx}", alpha=0.8)
-    ax_delta.legend()
-    ax_delta.set_title("Distance Change Per Env")
-    ax_delta.set_xlabel("Iteration")
-    ax_delta.set_ylabel("Delta from Iter 1 [m]")
-    ax_delta.grid(True, alpha=0.3)
-
-    for env_idx in range(min(n_envs, 5)):
-        x1 = np.arange(len(cp_hist))
-        p1 = ax_cp.plot([cp[env_idx] for cp in cp_hist], label=f"env {env_idx}", alpha=0.5)
-        ax_cp.scatter(x1, [cp[env_idx] for cp in cp_hist], color=p1[0].get_color())
-        p2 = ax_ang.plot([a[env_idx] for a in ang_hist], label=f"env {env_idx}", alpha=0.5)
-        ax_ang.scatter(x1, [a[env_idx] for a in ang_hist], color=p2[0].get_color())
-        p3 = ax_face.plot([f[env_idx] for f in face_hist], marker=".", linestyle="-", label=f"env {env_idx}", alpha=0.5)
-        ax_face.scatter(x1, [f[env_idx] for f in face_hist], color=p3[0].get_color())
-
-    lo_cp, hi_cp = CONTACT_POINT_BOUNDS
-    lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
-    ax_cp.axhline(lo_cp, color="gray", linestyle="--", linewidth=0.8)
-    ax_cp.axhline(hi_cp, color="gray", linestyle="--", linewidth=0.8)
-    ax_cp.legend()
-    ax_cp.set_title("Contact Point")
-    ax_cp.set_xlabel("Iteration")
-    ax_cp.set_ylabel("contact_point")
-    ax_cp.grid(True, alpha=0.3)
-
-    ax_ang.axhline(lo_ang, color="gray", linestyle="--", linewidth=0.8)
-    ax_ang.axhline(hi_ang, color="gray", linestyle="--", linewidth=0.8)
-    ax_ang.legend()
-    ax_ang.set_title("Angle")
-    ax_ang.set_xlabel("Iteration")
-    ax_ang.set_ylabel("angle [rad]")
-    ax_ang.grid(True, alpha=0.3)
-
-    ax_face.set_yticks(range(NUM_FACES))
-    ax_face.legend()
-    ax_face.set_title("Face Chosen (argmax)")
-    ax_face.set_xlabel("Iteration")
-    ax_face.set_ylabel("face index")
-    ax_face.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    if save_filepath is None:
-        save_filepath = save_dir / "surco_prior.png"
-    plt.savefig(save_filepath, bbox_inches="tight")
-    if save_filepath2 is not None:
-        plt.savefig(save_filepath2, bbox_inches="tight")
-    print(f"Saved plot to {save_filepath}")
-    plt.close()
-    if open_after_save:
-        print(f"xdg-open {save_filepath}")
-        os.system(f"xdg-open {save_filepath}")
 
 
 def save_json(
@@ -493,7 +421,7 @@ def save_json(
         "final_distance_per_env": final_dists_np.tolist(),
         "c": np.asarray(c_batch).tolist(),
         "x": x_batch.tolist(),
-        "dloss_dc": grad_c.tolist(),
+        "dloss_dc": grad_c.tolist() if grad_c is not None else None,
         "dloss_dx": None if grad_x is None else np.asarray(grad_x).tolist(),
         "baseline_mean_per_env": None if baseline_means_per_env is None else np.asarray(baseline_means_per_env).tolist(),
         "pct_vs_baseline_per_env": None if pct_vs_baseline_per_env is None else np.asarray(pct_vs_baseline_per_env).tolist(),
@@ -594,8 +522,8 @@ def main(
             ),
         )
 
-    mlp = MLP(context_dim=9, hidden_dims=(128, 128), output_dim=solver_output_dim)
-    params = mlp.init(jax.random.PRNGKey(0))
+    mlp = SurCoMLP(hidden_dims=(128, 128), output_dim=solver_output_dim)
+    params = mlp.init(jax.random.PRNGKey(0), jnp.zeros((1, 9)))
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adam(LR),
@@ -676,26 +604,24 @@ def main(
         ctx = env.get_context_vector(data)  # (n_envs, 9)
 
         if n_envs > 1:
-            def _assert_ctx_differ(ctx_np):
-                # [target_x, target_y, target_theta, rel_x, rel_y, rel_theta, rel_vx, rel_vy, vtheta]
-                ctx1 = ctx_np[0, 0:6]
-                ctx2 = ctx_np[1, 0:6]
-                min_diff = np.min(np.abs(ctx1 - ctx2))
-                assert min_diff > 1e-6, (
-                    f"Context vectors for env 0 and env 1 are identical:\n{ctx1}\n{ctx2}\nThis means "
-                    f"the env reset produced the same poses for all environments."
-                )
-            jax.debug.callback(_assert_ctx_differ, ctx)
+            def _check_ctx_all(ctx_np):
+                dupes = [i for i in range(1, n_envs) if np.allclose(ctx_np[i], ctx_np[0], atol=1e-6)]
+                if dupes:
+                    cprint(f"[CHECK FAIL] ctx identical to env0 for envs {dupes}", "red")
+                    for i in [0] + dupes:
+                        cprint(f"  ctx[{i}]={ctx_np[i]}", "red")
+                else:
+                    cprint(f"[CHECK OK] ctx all differ from env0", "green")
+            jax.debug.callback(_check_ctx_all, ctx)
 
         c = mlp.apply(params, ctx)  # (n_envs, action_dim)
 
-        # if n_envs > 1:
-        #     def _assert_c_differ(c_np):
-        #         assert not np.all(c_np[0] == c_np[1]), (
-        #             f"NN outputs c for env 0 and env 1 are identical:\n{c_np[0]}\nContext vectors "
-        #             f"may be different but MLP weights are producing the same output."
-        #         )
-        #     jax.debug.callback(_assert_c_differ, c)
+        if n_envs > 1:
+            def _check_c_all(c_np):
+                dupes = [i for i in range(1, n_envs) if np.allclose(c_np[i], c_np[0], atol=1e-6)]
+                if dupes:
+                    cprint(f"[CHECK FAIL] c identical to env0 for envs {dupes}", "red")
+            jax.debug.callback(_check_c_all, c)
 
         if verbosity > 1:
             jax.debug.print(
@@ -705,7 +631,7 @@ def main(
                 hi=ctx.max(),
             )
         if verbosity > 0:
-            jax.debug.print("ctx[0]={c0}  ctx[1]={c1}", c0=ctx[0], c1=ctx[1] if n_envs > 1 else ctx[0])
+            jax.debug.print("context={ctx}", ctx=ctx)
         return cost_from_c(c, data, rng_solve, verbosity, True)
 
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
@@ -736,6 +662,7 @@ def main(
     face_hist = []  # list of (n_envs,) int — argmax face per env per iter
     cp_hist = []  # list of (n_envs,) float — contact_point per env per iter
     ang_hist = []  # list of (n_envs,) float — angle per env per iter
+    c_face_hist = []  # list of (n_envs, NUM_FACES) float — face logits per env per iter
 
     n_envs_better_0 = None
     initial_mean_dist = None
@@ -767,17 +694,24 @@ def main(
 
         if n_envs > 1:
             jp = np.asarray(env_data_0.joint_positions)
-            if np.all(jp[0] == jp[1]):
-                cprint(f"[CHECK FAIL] joint_positions identical across envs", "red")
+            jp_dupes = [i for i in range(1, n_envs) if np.all(jp[i] == jp[0])]
+            if jp_dupes:
+                cprint(f"[CHECK FAIL] joint_positions identical to env0 for envs: {jp_dupes}", "red")
             else:
-                cprint(f"[CHECK OK] joint_positions differ across envs", "green")
+                cprint(f"[CHECK OK] joint_positions differ across all envs", "green")
 
             t_poses_np = env.t_poses
             tgt_poses_np = env.target_poses
-            if np.all(t_poses_np[0] == t_poses_np[1]):
-                cprint(f"[CHECK FAIL] t_poses identical: {t_poses_np}", "red")
+            t_dupes = [i for i in range(1, n_envs) if np.all(t_poses_np[i] == t_poses_np[0])]
+            tgt_dupes = [i for i in range(1, n_envs) if np.all(tgt_poses_np[i] == tgt_poses_np[0])]
+            if t_dupes:
+                cprint(f"[CHECK FAIL] t_poses identical to env0 for envs: {t_dupes}  values: {t_poses_np}", "red")
             else:
-                cprint(f"[CHECK OK] t_poses differ:  env0={t_poses_np[0]}  env1={t_poses_np[1]}", "green")
+                cprint(f"[CHECK OK] t_poses all differ", "green")
+            if tgt_dupes:
+                cprint(f"[CHECK FAIL] target_poses identical to env0 for envs: {tgt_dupes}  values: {tgt_poses_np}", "red")
+            else:
+                cprint(f"[CHECK OK] target_poses all differ", "green")
             if np.all(tgt_poses_np[0] == tgt_poses_np[1]):
                 cprint(f"[CHECK FAIL] target_poses identical: {tgt_poses_np}", "red")
             else:
@@ -828,7 +762,7 @@ def main(
         if nan_envs:
             for env_idx in nan_envs:
                 cprint(f"  Env: {env_idx} - T distance is NaN", "red")
-        n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for layer in g_raw for x in layer)
+        n_bad_grads = sum(not jnp.all(jnp.isfinite(x)).item() for x in jax.tree_util.tree_leaves(g_raw))
         if n_bad_grads > 0:
             cprint(
                 f"WARNING: {n_bad_grads} non-finite values in raw gradients (sanitized to 0 for this step).",
@@ -912,7 +846,7 @@ def main(
         #
         max_grad, mean_grad = None, None
         if verbosity > 0:
-            grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
+            grad_abs_values = [jnp.abs(g) for g in jax.tree_util.tree_leaves(g_params)]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
             mean_grad = float(jnp.mean(jnp.array([jnp.mean(g).item() for g in grad_abs_values])))
             cprint(f"|____ max |grad|: {max_grad:.6f}, mean |grad|: {mean_grad:.6f}", "yellow")
@@ -975,12 +909,13 @@ def main(
         face_hist.append(face_hist_current)
         cp_hist.append(cp_hist_current)
         ang_hist.append(ang_hist_current)
+        c_face_hist.append(np.asarray(c_batch)[:, :NUM_FACES])  # (n_envs, NUM_FACES)
 
         # Save weights and snapshot plot
         #
         if (it + 1) % 5 == 0:
             filepath = checkpoints_dir / f"mlp_iter_{it + 1:03d}.npz"
-            mlp.save_mlp_weights(filepath, params)
+            save_mlp_weights(filepath, params)
             cprint(f"|____ saved weights to {filepath}", "yellow")
             plot_results(
                 save_dir=save_dir,
@@ -993,6 +928,8 @@ def main(
                 n_envs=n_envs,
                 n_sim_steps=N_SIM_STEPS,
                 n_opt_steps=N_OPT_STEPS,
+                m_rollouts=M_ROLLOUTS,
+                perturb_lambda=PERTURB_LAMBDA,
                 random_t_pose=random_t_pose,
                 relative_coordinates=relative_coordinates,
                 random_means=random_means if random_means else None,
@@ -1008,7 +945,7 @@ def main(
             lowest_mean_dist = mean_dist
             cprint(f"New lowest mean dist: {lowest_mean_dist:.5f} [m]", "green")
             filepath = checkpoints_dir / f"mlp_lowest_mean_dist.npz"
-            mlp.save_mlp_weights(filepath, params)
+            save_mlp_weights(filepath, params)
             if record_video:
                 save_filepath = save_dir / f"best.mp4"
                 env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
@@ -1030,25 +967,6 @@ def main(
     if use_wandb:
         wandb.finish()
 
-    # ── Plots ──────────────────────────────────────────────────────────────────
-    plot_results(
-        save_dir=save_dir,
-        means=means,
-        stds=stds,
-        dist_delta_hist=dist_delta_hist,
-        face_hist=face_hist,
-        cp_hist=cp_hist,
-        ang_hist=ang_hist,
-        n_envs=n_envs,
-        n_sim_steps=N_SIM_STEPS,
-        n_opt_steps=N_OPT_STEPS,
-        random_t_pose=random_t_pose,
-        relative_coordinates=relative_coordinates,
-        random_means=random_means if random_means else None,
-        random_stds=random_stds if random_stds else None,
-        baseline_iters=baseline_iters if baseline_iters else None,
-        open_after_save=True,
-    )
 
 
 if __name__ == "__main__":

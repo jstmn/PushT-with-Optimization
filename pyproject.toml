@@ -23,7 +23,8 @@ dependencies = [
     "termcolor",
     "gurobipy",
     "tqdm",
-    "wandb"
+    "wandb",
+    "flax"
 ]
 
 [project.optional-dependencies]
