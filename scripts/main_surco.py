@@ -48,7 +48,7 @@ System design (SurCo-prior):
        x[6] ∈ CONTACT_POINT_BOUNDS  (continuous)
        x[7] ∈ ANGLE_BOUNDS          (continuous)
    Gradient via Berthet et al. 2020 randomized smoothing through the solve.
-3. Rollout via step_pure_soft (differentiable physics; one-hot face is valid input).
+3. Rollout via step_pure_soft (differentiable physics; one-hot face).
 4. Loss: run one rollout using the clean Gurobi solution x* for the predicted
    face logits and continuous targets.
 5. Backprop through the rollout, then use randomized smoothing only in the
@@ -60,23 +60,8 @@ System design (SurCo-prior):
 
 # Random t-pose
 python scripts/main_surco.py --n-envs 64 --random-t-pose
-python scripts/main_surco.py --n-envs 16 --relative-coordinates --random-t-pose --relative-coordinates
-python scripts/main_surco.py --n-envs 25 --relative-coordinates --random-t-pose --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 25 --relative-coordinates --random-t-pose --verbosity 1 --record-video --multi-step-n-actions 2
-python scripts/main_surco.py --n-envs 1 --use-soft-face --random-t-pose --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 1 --use-hard-face --random-t-pose --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-soft-face --random-t-pose --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-hard-face --random-t-pose --verbosity 1 --record-video
 
-
-# Fixed t-pose
-python scripts/main_surco.py --n-envs 25 --verbosity 1 --record-video
-
-python scripts/main_surco.py --n-envs 1 --use-soft-face --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 1 --use-hard-face --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-soft-face --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 1 --relative-coordinates --use-hard-face --verbosity 1 --record-video
-
+python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --record-video
 """
 
 from __future__ import annotations
@@ -110,7 +95,7 @@ LR = 0.01
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
-M_ROLLOUTS = 10
+M_ROLLOUTS = 9
 RANDOM_ACTION_SAMPLE_K = 5
 FACE_OUTPUT_REG_BETA = 0.05
 CONT_OUTPUT_REG_BETA = 0.005
@@ -125,12 +110,16 @@ PERTURB_LAMBDA = 1.25
 
 
 _SOLVER = ActionSolver()
-_ENV: "PushTEnv | None" = None
-_ENV_BACKWARD: "PushTEnv | None" = None
+_ENV: PushTEnv | None = None
+_ENV_BACKWARD: PushTEnv | None = None
 _CP_MID = 0.5 * (CONTACT_POINT_BOUNDS[0] + CONTACT_POINT_BOUNDS[1])
 _ANG_MID = 0.5 * (float(ANGLE_BOUNDS[0]) + float(ANGLE_BOUNDS[1]))
 _CP_SCALE = CONTACT_POINT_BOUNDS[1] - CONTACT_POINT_BOUNDS[0]
 _ANG_SCALE = float(ANGLE_BOUNDS[1]) - float(ANGLE_BOUNDS[0])
+
+_BACKWARD_LOG_DIR: Path | None = None
+_CURRENT_ITERATION: int = -1
+_LAST_GRAD_X: np.ndarray | None = None
 
 
 def _configure_solver(multi_step_n_actions: int | None) -> None:
@@ -143,26 +132,31 @@ def _configure_solver(multi_step_n_actions: int | None) -> None:
     _SOLVER = ActionSolverMultiStep(n_actions=multi_step_n_actions)
 
 
-def _configure_env(env: "PushTEnv") -> None:
+def _configure_env(env: PushTEnv) -> None:
     global _ENV
     _ENV = env
 
-def _configure_backward_env(env: "PushTEnv") -> None:
+def _configure_backward_env(env: PushTEnv) -> None:
     global _ENV_BACKWARD
     _ENV_BACKWARD = env
 
 
+def _configure_backward_log_dir(path: Path) -> None:
+    global _BACKWARD_LOG_DIR
+    _BACKWARD_LOG_DIR = path
+
+
 def _run_rollout(
-    face_weights: jnp.ndarray,  # (N, n_actions, NUM_FACES) — soft weights or one-hot
+    face_weights: jnp.ndarray,  # (N, n_actions, NUM_FACES) — one-hot
     cp: jnp.ndarray,            # (N, n_actions)
     ang: jnp.ndarray,           # (N, n_actions)
     data,
-    env: "PushTEnv | None" = None,
+    env: PushTEnv | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Run all action blocks sequentially through step_pure_soft.
 
     Returns (mean_final_dist scalar, t_distances (N, total_steps), jpos_traj (N, total_steps, dofs)).
-    Differentiable w.r.t. cp and ang; face_weights treated as constants when one-hot.
+    Differentiable w.r.t. cp and ang.
     Pass env explicitly to use a different environment (e.g. _ENV_BACKWARD).
     """
     env = env or _ENV
@@ -242,6 +236,8 @@ def _milp_backward(res, grad_x):
     key = sample_rng
     face_weights_ks: list = []
     eps_faces: list = []
+    x_ks: list = []
+    c_pert_ks: list = []
 
     if verbosity > 0:
         jax.debug.print("  c={c}", c=c)
@@ -260,6 +256,8 @@ def _milp_backward(res, grad_x):
         x_k_blocks = x_k.reshape(n_envs, n_actions, ACTION_DIM)
         face_weights_ks.append(x_k_blocks[:, :, :NUM_FACES])  # (N, n_actions, F) one-hot
         eps_faces.append(eps_face)
+        x_ks.append(x_k)
+        c_pert_ks.append(c_pert)
 
     # Stack all M face-weight arrays → (M*N, n_actions, F); tile data → (M*N, ...).
     # All M rollouts share the same cp/ang (only face differs), so we tile those too
@@ -272,12 +270,13 @@ def _milp_backward(res, grad_x):
         cp_tiled = jnp.repeat(cp, M_ROLLOUTS, axis=0)   # (M*N, n_actions)
         ang_tiled = jnp.repeat(ang, M_ROLLOUTS, axis=0)
         _, t_dists, _ = _run_rollout(face_weights_all, cp_tiled, ang_tiled, data_tiled, _ENV_BACKWARD)
-        # t_dists: (M*N, total_steps) → per-rollout costs (M,)
-        L_ks = jnp.nanmean(t_dists[:, -1].reshape(M_ROLLOUTS, n_envs), axis=1)
-        return L_ks.mean(), L_ks  # scalar for grad, L_ks as aux
+        # t_dists: (M*N, total_steps) → per-rollout costs (M, N)
+        costs_per_env = t_dists[:, -1].reshape(M_ROLLOUTS, n_envs)
+        L_ks = jnp.nanmean(costs_per_env, axis=1)
+        return L_ks.mean(), (L_ks, costs_per_env)
 
     # One parallel backward pass: L_ks for MC face estimator, grads for continuous.
-    (_, L_ks), (grad_cp_0, grad_ang_0) = jax.value_and_grad(
+    (_, (L_ks, costs_per_env_all)), (grad_cp_0, grad_ang_0) = jax.value_and_grad(
         all_rollouts_cost, argnums=(0, 1), has_aux=True
     )(cp_0, ang_0)
     # grad_cp_0 = (1/M) Σ_k ∂L_k/∂cp  (chain rule through jnp.repeat averages over M)
@@ -300,6 +299,25 @@ def _milp_backward(res, grad_x):
         jax.debug.print("  L_mean={L_mean}", L_mean=L_mean)
 
     grad_c = grad_c_face + grad_c_continuous
+
+    global _LAST_GRAD_X
+    _LAST_GRAD_X = np.asarray(grad_x)
+    if _BACKWARD_LOG_DIR is not None and _CURRENT_ITERATION >= 0:
+        np.savez(
+            _BACKWARD_LOG_DIR / f"{_CURRENT_ITERATION:03d}.npz",
+            c=np.asarray(c),
+            x_star=np.asarray(x_star),
+            grad_x=np.asarray(grad_x),
+            eps_faces=np.stack([np.asarray(e) for e in eps_faces], axis=0),      # (M, N, D)
+            x_perturbed=np.stack([np.asarray(xk) for xk in x_ks], axis=0),      # (M, N, D)
+            c_perturbed=np.stack([np.asarray(ck) for ck in c_pert_ks], axis=0), # (M, N, D)
+            costs_per_env=np.asarray(costs_per_env_all),                         # (M, N)
+            L_ks=np.asarray(L_ks),                                               # (M,)
+            grad_c=np.asarray(grad_c),
+            grad_c_face=np.asarray(grad_c_face),
+            grad_c_continuous=np.asarray(grad_c_continuous),
+        )
+
     return (grad_c, None, None, None)
 
 
@@ -318,8 +336,7 @@ def plot_results(
     n_sim_steps,
     n_opt_steps,
     random_t_pose,
-    relative_coordinates: bool,
-    use_soft_face: bool,
+    relative_coordinates: bool = False,
     random_means=None,
     random_stds=None,
     save_filepath=None,
@@ -333,7 +350,7 @@ def plot_results(
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  n_sim_steps={n_sim_steps}  "
         f"n_opt_steps={n_opt_steps}  M={M_ROLLOUTS}  λ={PERTURB_LAMBDA}  "
-        f"RANDOM_T_POSE={random_t_pose}  FACE_MODE={'soft' if use_soft_face else 'hard'}  RELATIVE_COORDINATES={relative_coordinates}",
+        f"RANDOM_T_POSE={random_t_pose}  RELATIVE_COORDINATES={relative_coordinates}",
         fontweight="bold",
     )
     ax_mean, ax_std = axes[0, 0], axes[0, 1]
@@ -436,6 +453,7 @@ def save_json(
     grad_c,
     random_action_mean_final_distance=None,
     random_action_std_final_distance=None,
+    grad_x=None,
 ):
     iteration_payload = {
         "iteration": iteration,
@@ -445,6 +463,7 @@ def save_json(
         "c": np.asarray(c_batch).tolist(),
         "x": x_batch.tolist(),
         "dloss_dc": grad_c.tolist(),
+        "dloss_dx": None if grad_x is None else np.asarray(grad_x).tolist(),
         "random_action_mean_final_distance": (
             None if random_action_mean_final_distance is None else float(random_action_mean_final_distance)
         ),
@@ -500,16 +519,13 @@ def main(
     verbosity: int,
     random_t_pose: bool,
     record_video: bool,
-    use_soft_face: bool,
-    use_hard_face: bool,
     multi_step_n_actions: int | None,
     disable_random: bool,
     relative_coordinates: bool,
 ):
+    global _CURRENT_ITERATION
     assert problem_type in ["single_step", "multi_step"], "problem_type must be 'single_step' or 'multi_step'."
     assert verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
-    assert use_soft_face or use_hard_face, "At least one of use_soft_face or use_hard_face must be True."
-    assert not (use_soft_face and use_hard_face), "use_soft_face and use_hard_face cannot be True at the same time."
     is_multi_step = multi_step_n_actions is not None
     n_actions = multi_step_n_actions if is_multi_step else 1
     _configure_solver(multi_step_n_actions)
@@ -530,6 +546,9 @@ def main(
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     iterations_dir = save_dir / "iterations"
     iterations_dir.mkdir(parents=True, exist_ok=True)
+    backward_dir = save_dir / "backward"
+    backward_dir.mkdir(parents=True, exist_ok=True)
+    _configure_backward_log_dir(backward_dir)
     os.system(f"xdg-open {save_dir}")
 
     mlp = MLP(context_dim=9, hidden_dims=(128, 128), output_dim=solver_output_dim)
@@ -541,9 +560,6 @@ def main(
     opt_state = optimizer.init(params)
 
     def cost_from_c(c, data, rng_solve, solver_verbosity: int, log_forward: bool):
-        if verbosity > 1:
-            pass
-
         # Do one clean forward solve/rollout. The M_ROLLOUTS Monte Carlo rollouts
         # used for gradient estimation live in milp_solver's custom VJP.
         x_star = milp_solver(c, data, rng_solve, solver_verbosity)  # (n_envs, action_dim)
@@ -552,9 +568,9 @@ def main(
         face_weights = x_star_blocks[:, :, :NUM_FACES]
         contact_points = x_star_blocks[:, :, NUM_FACES]
         angles = x_star_blocks[:, :, NUM_FACES + 1]
+        face_idx = jnp.argmax(face_weights, axis=-1)
 
         if log_forward and verbosity > 0:
-            face_idx = jnp.argmax(face_weights, axis=-1)
             jax.debug.print("rollout action")
             jax.debug.print(
                 "|__ face={face}\n|__ contact_point (lims: {lo_cp:.3f}, {hi_cp:.3f})={cp}\n|__ angle (lims: {lo_ang:.3f}, {hi_ang:.3f})={a}",
@@ -568,12 +584,7 @@ def main(
             )
             jax.debug.print("|__")
 
-        # Hard face: pass one-hot weights so _run_rollout can always use step_pure_soft.
-        # One-hot @ face_geometry == hard gather, so physics is identical to step_pure.
-        if use_hard_face:
-            face_weights_in = jax.nn.one_hot(jnp.argmax(face_weights, axis=-1), NUM_FACES)
-        else:
-            face_weights_in = face_weights
+        face_weights_in = jax.nn.one_hot(face_idx, NUM_FACES)
         task_loss, t_distances, jpos_traj = _run_rollout(face_weights_in, contact_points, angles, data)
 
         final_dists = t_distances[:, -1]
@@ -612,8 +623,8 @@ def main(
         return cost_from_c(c, data, rng_solve, verbosity, True)
 
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
-    # solve, so a JIT wrapper adds overhead without benefit. step_pure_soft is
-    # already JIT'd internally, so physics stays compiled.
+    # solve, so a JIT wrapper adds overhead without benefit. Physics is already
+    # JIT'd internally.
     cost_and_grad = jax.value_and_grad(cost, argnums=0, has_aux=True)
     grad_loss_wrt_c = jax.grad(lambda c, data, rng_solve: cost_from_c(c, data, rng_solve, 0, False)[0], argnums=0)
 
@@ -641,6 +652,7 @@ def main(
     t_start = time()
 
     for it in range(N_OPT_STEPS):
+        _CURRENT_ITERATION = it
         if it == 0:
             print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
 
@@ -754,6 +766,7 @@ def main(
             grad_c,
             random_mean,
             random_std,
+            grad_x=_LAST_GRAD_X,
         )
 
         # Print gradient statistics
@@ -794,7 +807,6 @@ def main(
                 n_sim_steps=N_SIM_STEPS,
                 n_opt_steps=N_OPT_STEPS,
                 random_t_pose=random_t_pose,
-                use_soft_face=use_soft_face,
                 relative_coordinates=relative_coordinates,
                 random_means=random_means if random_means else None,
                 random_stds=random_stds if random_stds else None,
@@ -837,6 +849,7 @@ def main(
         n_sim_steps=N_SIM_STEPS,
         n_opt_steps=N_OPT_STEPS,
         random_t_pose=random_t_pose,
+        relative_coordinates=relative_coordinates,
         random_means=random_means if random_means else None,
         random_stds=random_stds if random_stds else None,
         open_after_save=True,
@@ -852,8 +865,6 @@ if __name__ == "__main__":
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--multi-step-n-actions", type=int)
     parser.add_argument("--disable-random", action="store_true", help="Skip random action baseline sampling")
-    parser.add_argument("--use-soft-face", action="store_true", help="Use soft face mode")
-    parser.add_argument("--use-hard-face", action="store_true", help="Use hard face mode")
     parser.add_argument("--relative-coordinates", action="store_true", help="Use relative coordinates")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
@@ -866,7 +877,5 @@ if __name__ == "__main__":
         record_video=args.record_video,
         multi_step_n_actions=args.multi_step_n_actions,
         disable_random=args.disable_random,
-        use_soft_face=args.use_soft_face,
-        use_hard_face=args.use_hard_face,
         relative_coordinates=args.relative_coordinates,
     )

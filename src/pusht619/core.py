@@ -710,6 +710,7 @@ class PushTEnv:
     """
 
     def __init__(self, nenvs: int, use_relative_coordinates: bool = False, record_video: bool = False, visualize: bool = False):
+        assert abs(nenvs - int(jnp.sqrt(nenvs))**2) < 1e-6, f"nenvs must be a perfect square, got {nenvs}"
         self._nenvs = nenvs
         self._use_relative_coordinates = use_relative_coordinates
         self._record_video = record_video
