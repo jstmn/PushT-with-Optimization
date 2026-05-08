@@ -60,6 +60,7 @@ System design (SurCo-prior):
 
 # Random t-pose
 python scripts/main_surco.py --n-envs 64 --random-t-pose
+python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --random-t-pose --record-video
 
 python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --record-video
 """
@@ -75,14 +76,13 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 from termcolor import cprint
+import wandb
 import jax
 
 jax.config.update("jax_compilation_cache_dir", str(Path.home() / ".cache/jax_pusht619"))
 import jax.numpy as jnp
 import numpy as np
 import argparse
-from tqdm.auto import tqdm  # pyright: ignore[reportMissingModuleSource]
-
 import optax
 from pusht619.models import MLP, ActionSolver, ActionSolverMultiStep
 from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES
@@ -90,15 +90,20 @@ from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
+
+TODO: With a large CONT_OUTPUT_REG_BETA, the contact point should be pushed to the midpoint of the bounds, but that 
+isn't happening.
+
 N_OPT_STEPS = 250
 LR = 0.01
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
 M_ROLLOUTS = 9
-RANDOM_ACTION_SAMPLE_K = 5
 FACE_OUTPUT_REG_BETA = 0.05
-CONT_OUTPUT_REG_BETA = 0.005
+CONT_OUTPUT_REG_BETA = 10
+# CONT_OUTPUT_REG_BETA = 0.1
+# CONT_OUTPUT_REG_BETA = 0.005
 CP_TARGET_WEIGHT = 1.0
 ANG_TARGET_WEIGHT = 1.0
 RANDOM_T_POSE_EVAL_EVERY = 25
@@ -359,29 +364,33 @@ def plot_results(
 
     ax_mean.axhline(float(initial_mean_loss), label="initial mean", color="black", linestyle="--")
     ax_mean.plot(x_iters, means, label="training mean", color="tab:red")
-    if has_random_baseline:
-        ax_mean.plot(x_iters, random_means, label="random mean", color="tab:blue")
-        ax_mean.fill_between(
-            x_iters,
-            np.asarray(random_means) - np.asarray(random_stds),
-            np.asarray(random_means) + np.asarray(random_stds),
-            color="tab:blue",
-            alpha=0.2,
-            label="random mean ± std",
-        )
     ax_mean.legend()
-    ax_mean.set_title("Mean Distance")
+    ax_mean.set_title("Mean Final Distance")
     ax_mean.set_xlabel("Iteration")
     ax_mean.set_ylabel("Distance [m]")
     ax_mean.grid(True, alpha=0.3)
 
-    ax_std.plot(x_iters, stds, label="training std", color="tab:red")
     if has_random_baseline:
-        ax_std.plot(x_iters, random_stds, label="random std", color="tab:blue")
-    ax_std.legend()
-    ax_std.set_title("Standard Deviation")
-    ax_std.set_xlabel("Iteration")
-    ax_std.set_ylabel("Std [m]")
+        ax_std.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
+        ax_std.plot(x_iters, random_means, label="mean % vs baseline", color="tab:green")
+        ax_std.fill_between(
+            x_iters,
+            np.asarray(random_means) - np.asarray(random_stds),
+            np.asarray(random_means) + np.asarray(random_stds),
+            color="tab:green",
+            alpha=0.2,
+            label="± std across envs",
+        )
+        ax_std.legend()
+        ax_std.set_title("% vs Center-Action Baseline")
+        ax_std.set_xlabel("Iteration")
+        ax_std.set_ylabel("% change (negative = better)")
+    else:
+        ax_std.plot(x_iters, stds, label="training std", color="tab:red")
+        ax_std.legend()
+        ax_std.set_title("Final Distance Std")
+        ax_std.set_xlabel("Iteration")
+        ax_std.set_ylabel("Std [m]")
     ax_std.grid(True, alpha=0.3)
 
     mean_delta = [float(np.nanmean(delta)) for delta in dist_delta_hist]
@@ -451,8 +460,8 @@ def save_json(
     c_batch,
     x_batch,
     grad_c,
-    random_action_mean_final_distance=None,
-    random_action_std_final_distance=None,
+    baseline_means_per_env=None,   # (nenvs,) or None
+    pct_vs_baseline_per_env=None,  # (nenvs,) or None
     grad_x=None,
 ):
     iteration_payload = {
@@ -464,50 +473,38 @@ def save_json(
         "x": x_batch.tolist(),
         "dloss_dc": grad_c.tolist(),
         "dloss_dx": None if grad_x is None else np.asarray(grad_x).tolist(),
-        "random_action_mean_final_distance": (
-            None if random_action_mean_final_distance is None else float(random_action_mean_final_distance)
-        ),
-        "random_action_std_final_distance": (
-            None if random_action_std_final_distance is None else float(random_action_std_final_distance)
-        ),
-        "random_action_sample_k": None if random_action_mean_final_distance is None else RANDOM_ACTION_SAMPLE_K,
+        "baseline_mean_per_env": None if baseline_means_per_env is None else np.asarray(baseline_means_per_env).tolist(),
+        "pct_vs_baseline_per_env": None if pct_vs_baseline_per_env is None else np.asarray(pct_vs_baseline_per_env).tolist(),
+        "mean_pct_vs_baseline": None if pct_vs_baseline_per_env is None else float(np.nanmean(pct_vs_baseline_per_env)),
     }
     iteration_json_path.write_text(json.dumps(iteration_payload, indent=2))
 
 
-def random_action_mean_variance(
+def center_action_baseline(
     eval_env: PushTEnv,
-    target_pose: np.ndarray,
-    t_pose: np.ndarray,
-    seed: int,
-    random_sample_k: int,
-    n_action_steps: int = 1,
-) -> tuple[float, float]:
-    rng = np.random.default_rng(seed=seed)
-    results: list[float] = []
-    target_poses = np.asarray(target_pose, dtype=np.float32).reshape(1, 3)
-    t_poses = np.asarray(t_pose, dtype=np.float32).reshape(1, 3)
-    for k in tqdm(range(random_sample_k), desc="Random actions", unit="action", leave=False):
-        eval_env.reset(seed=seed + k, target_poses=target_poses, t_poses=t_poses)
-        final_distance = None
-        for _action_idx in range(n_action_steps):
-            action = Action(
-                face=np.array([[rng.integers(NUM_FACES)]], dtype=np.int32),
-                contact_point=np.array(
-                    [[rng.uniform(CONTACT_POINT_BOUNDS[0], CONTACT_POINT_BOUNDS[1])]],
-                    dtype=np.float32,
-                ),
-                angle=np.array(
-                    [[rng.uniform(float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1]))]],
-                    dtype=np.float32,
-                ),
-            )
-            result = eval_env.step(action=action, n_sim_steps=N_SIM_STEPS, check_t_displacement=False)
-            t_distances = np.asarray(result.t_distances)[0]
-            final_distance = float(t_distances[-1])
-        assert final_distance is not None, "n_action_steps must be positive"
-        results.append(final_distance)
-    return float(np.mean(results)), float(np.std(results))
+    target_poses: np.ndarray,  # (nenvs, 3)
+    t_poses: np.ndarray,       # (nenvs, 3)
+) -> tuple[np.ndarray, np.ndarray]:
+    """Try center contact point and angle on each face for all envs.
+
+    Returns (mean_per_env, std_per_env) each shape (nenvs,), where mean/std
+    are computed across the NUM_FACES faces.
+    """
+    nenvs = eval_env.nenvs
+    cp_center = np.full((nenvs, 1), _CP_MID, dtype=np.float32)
+    ang_center = np.full((nenvs, 1), _ANG_MID, dtype=np.float32)
+    face_dists = []
+    for face_idx in range(NUM_FACES):
+        eval_env.reset(target_poses=target_poses, t_poses=t_poses)
+        action = Action(
+            face=np.full((nenvs, 1), face_idx, dtype=np.int32),
+            contact_point=cp_center,
+            angle=ang_center,
+        )
+        result = eval_env.step(action=action, n_sim_steps=N_SIM_STEPS, check_t_displacement=False)
+        face_dists.append(np.asarray(result.t_distances)[:, -1])  # (nenvs,)
+    face_dists_arr = np.stack(face_dists, axis=0)  # (NUM_FACES, nenvs)
+    return face_dists_arr.mean(axis=0), face_dists_arr.std(axis=0)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -522,6 +519,7 @@ def main(
     multi_step_n_actions: int | None,
     disable_random: bool,
     relative_coordinates: bool,
+    use_wandb: bool = True,
 ):
     global _CURRENT_ITERATION
     assert problem_type in ["single_step", "multi_step"], "problem_type must be 'single_step' or 'multi_step'."
@@ -534,7 +532,7 @@ def main(
     _configure_env(env)
     backward_env = PushTEnv(nenvs=n_envs * M_ROLLOUTS, record_video=False, visualize=False, use_relative_coordinates=relative_coordinates)
     _configure_backward_env(backward_env)
-    random_eval_env = None if disable_random else PushTEnv(nenvs=1, record_video=False, visualize=False)
+    baseline_env = None if disable_random else PushTEnv(nenvs=n_envs, record_video=False, visualize=False)
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
     solver_output_dim = ACTION_DIM * n_actions
@@ -550,6 +548,27 @@ def main(
     backward_dir.mkdir(parents=True, exist_ok=True)
     _configure_backward_log_dir(backward_dir)
     os.system(f"xdg-open {save_dir}")
+
+    if use_wandb:
+        wandb.init(
+            project="pusht619-surco",
+            name=save_dir.name,
+            config=dict(
+                n_envs=n_envs,
+                lr=LR,
+                n_opt_steps=N_OPT_STEPS,
+                n_sim_steps=N_SIM_STEPS,
+                m_rollouts=M_ROLLOUTS,
+                perturb_lambda=PERTURB_LAMBDA,
+                face_output_reg_beta=FACE_OUTPUT_REG_BETA,
+                cont_output_reg_beta=CONT_OUTPUT_REG_BETA,
+                num_faces=NUM_FACES,
+                problem_type=problem_type,
+                n_actions=n_actions,
+                random_t_pose=random_t_pose,
+                relative_coordinates=relative_coordinates,
+            ),
+        )
 
     mlp = MLP(context_dim=9, hidden_dims=(128, 128), output_dim=solver_output_dim)
     params = mlp.init(jax.random.PRNGKey(0))
@@ -587,27 +606,30 @@ def main(
         face_weights_in = jax.nn.one_hot(face_idx, NUM_FACES)
         task_loss, t_distances, jpos_traj = _run_rollout(face_weights_in, contact_points, angles, data)
 
-        final_dists = t_distances[:, -1]
-        # The face logits are scale-invariant up to ordering, so lightly
-        # penalize them to keep smoothing effective. The per-face targets are
-        # already bounded by the sigmoid head.
-        c_reg = FACE_OUTPUT_REG_BETA * jnp.mean(jnp.square(c_blocks[:, :, :NUM_FACES]))
-        cont_reg = CONT_OUTPUT_REG_BETA * jnp.mean(
-            jnp.square((contact_points - _CP_MID) / _CP_SCALE) + jnp.square((angles - _ANG_MID) / _ANG_SCALE)
-        )
-        loss = task_loss + c_reg + cont_reg
+
+        # Regularize c_blocks (NN outputs) directly, not contact_points/angles
+        # from x_star. Those flow through the Gurobi VJP which replaces the
+        # continuous gradient with an MC estimate and discards grad_x, so any
+        # loss term routed through x_star[cont] gets zero gradient back to c.
+        c_cp = c_blocks[:, :, NUM_FACES]
+        c_angle = c_blocks[:, :, NUM_FACES + 1]
+        face_logit_regularization = FACE_OUTPUT_REG_BETA * jnp.mean(jnp.square(c_blocks[:, :, :NUM_FACES]))
+        cp_regularization = CONT_OUTPUT_REG_BETA * jnp.mean(jnp.square((c_cp - _CP_MID) / _CP_SCALE))
+        angle_regularization = CONT_OUTPUT_REG_BETA * jnp.mean(jnp.square((c_angle - _ANG_MID) / _ANG_SCALE))
+        loss = task_loss + face_logit_regularization + cp_regularization + angle_regularization
 
         if log_forward and verbosity > 0:
             jax.debug.print(
-                "  sum(is_nan)={n} task_loss={task_loss:.6f} c_reg={c_reg:.6f} cont_reg={cont_reg:.6f}",
+                "  sum(is_nan)={n} task_loss={task_loss:.6f} face_logit_regularization={flr:.6f} cp_regularization={cpr:.6f} angle_regularization={ar:.6f}",
                 n=jnp.sum(jnp.isnan(t_distances[:, -1])),
                 task_loss=task_loss,
-                c_reg=c_reg,
-                cont_reg=cont_reg,
+                flr=face_logit_regularization,
+                cpr=cp_regularization,
+                ar=angle_regularization,
             )
         if log_forward and verbosity > 1:
             jax.debug.print("  final_dists={d}", d=t_distances[:, -1])
-        return loss, (t_distances, jpos_traj, face_weights, contact_points, angles, c)
+        return loss, (t_distances, jpos_traj, face_weights, contact_points, angles, c, task_loss, face_logit_regularization, cp_regularization, angle_regularization)
 
     def cost(params, data, rng_solve):
         ctx = env.get_context_vector(data)  # (n_envs, 9)
@@ -671,7 +693,7 @@ def main(
         t0 = time()
         env_data_0 = env.data
         step_key = jax.random.PRNGKey(it)
-        (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch)), g_raw = cost_and_grad(
+        (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch, task_loss, face_logit_regularization, cp_regularization, angle_regularization)), g_raw = cost_and_grad(
             params, env_data_0, step_key
         )
         final_dists_np = np.asarray(t_distances[:, -1])
@@ -722,8 +744,9 @@ def main(
         if n_envs_better_0 is None:
             n_envs_better_0 = sum(final_dists_np < initial_mean_dist - 0.05)
         delta_cm = 100 * (mean_dist - initial_mean_dist)
+        initial_str = f" | initial mean @ t=0: {initial_mean_dist:.5f} [m]" if not random_t_pose else ""
         cprint(
-            f"|____ mean dist: {mean_dist:.5f} [m] | delta from initial: {delta_cm:.3f} [cm] | initial mean @ t=0: {initial_mean_dist:.5f} [m] | {dt * 1000:.1f} ms",
+            f"|____ mean dist: {mean_dist:.5f} [m] | delta from initial: {delta_cm:.3f} [cm]{initial_str} | {dt * 1000:.1f} ms",
             "green" if delta_cm < 0 else "red",
         )
         n_envs_better = sum(final_dists_np < initial_mean_dist - 0.05)
@@ -739,21 +762,29 @@ def main(
         if verbosity > 1:
             cprint(f"|____ c=           {np.asarray(c_batch).tolist()}", "yellow")
             cprint(f"|____ dloss/dc=    {grad_c.tolist()}", "yellow")
-        random_mean = None
-        random_std = None
+        baseline_means_np = None
+        pct_vs_baseline = None
+        mean_pct_vs_baseline = None
         if not disable_random:
-            assert random_eval_env is not None
-            random_mean, random_std = random_action_mean_variance(
-                random_eval_env,
-                target_pose=env.target_poses[0],
-                t_pose=env.t_poses[0],
-                seed=it,
-                random_sample_k=RANDOM_ACTION_SAMPLE_K,
-                n_action_steps=n_actions,
+            assert baseline_env is not None
+            baseline_means_np, _ = center_action_baseline(
+                baseline_env,
+                target_poses=env.target_poses,
+                t_poses=env.t_poses,
+            )
+            pct_vs_baseline = 100.0 * (final_dists_np - baseline_means_np) / np.maximum(baseline_means_np, 1e-8)
+            mean_pct_vs_baseline = float(np.nanmean(pct_vs_baseline))
+            cprint(
+                f"|____ baseline mean per env:  {np.round(baseline_means_np, 5).tolist()}",
+                "cyan",
             )
             cprint(
-                f"|____ random baseline (env 0): mean={random_mean:.5f} [m], std={random_std:.5f} [m], k={RANDOM_ACTION_SAMPLE_K}",
-                "cyan",
+                f"|____ % vs baseline per env:  {np.round(pct_vs_baseline, 3).tolist()}",
+                "cyan" if mean_pct_vs_baseline < 0 else "yellow",
+            )
+            cprint(
+                f"|____ mean % vs baseline: {mean_pct_vs_baseline:.4f}%",
+                "green" if mean_pct_vs_baseline < 0 else "red",
             )
         save_json(
             iterations_dir / f"{it:03d}.json",
@@ -764,26 +795,59 @@ def main(
             c_batch,
             x_batch,
             grad_c,
-            random_mean,
-            random_std,
+            baseline_means_np,
+            pct_vs_baseline,
             grad_x=_LAST_GRAD_X,
         )
 
         # Print gradient statistics
         #
+        max_grad, mean_grad = None, None
         if verbosity > 0:
             grad_abs_values = [jnp.abs(g) for layer in g_params for g in layer]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
-            mean_grad = jnp.mean(jnp.array([jnp.mean(g).item() for g in grad_abs_values]))
+            mean_grad = float(jnp.mean(jnp.array([jnp.mean(g).item() for g in grad_abs_values])))
             cprint(f"|____ max |grad|: {max_grad:.6f}, mean |grad|: {mean_grad:.6f}", "yellow")
+
+        if use_wandb:
+            wandb_payload: dict = {
+                "loss": float(loss),
+                "loss/task": float(task_loss),
+                "loss/face_logit_regularization": float(face_logit_regularization),
+                "loss/cp_regularization": float(cp_regularization),
+                "loss/angle_regularization": float(angle_regularization),
+                "mean_final_dist": mean_dist,
+                "std_final_dist": float(np.nanstd(final_dists_np)),
+                "n_nan_envs": len(nan_envs),
+                "n_bad_grads": n_bad_grads,
+                "iter_time_ms": dt * 1000,
+                "n_envs_better": int(n_envs_better),
+            }
+            if mean_pct_vs_baseline is not None and pct_vs_baseline is not None:
+                wandb_payload["mean_pct_vs_baseline"] = mean_pct_vs_baseline
+                wandb_payload["std_pct_vs_baseline"] = float(np.nanstd(pct_vs_baseline))
+            if max_grad is not None:
+                wandb_payload["max_grad"] = max_grad
+                wandb_payload["mean_grad"] = mean_grad
+            wandb.log(wandb_payload, step=it)
+            if n_envs == 1:
+                c0 = np.asarray(c_batch)[0]
+                dc0 = np.asarray(grad_c)[0]
+                c_log = {f"c/face_{fi}": float(c0[fi]) for fi in range(NUM_FACES)}
+                c_log["c/contact_point"] = float(c0[NUM_FACES])
+                c_log["c/angle"] = float(c0[NUM_FACES + 1])
+                dc_log = {f"dc/face_{fi}": float(dc0[fi]) for fi in range(NUM_FACES)}
+                dc_log["dc/contact_point"] = float(dc0[NUM_FACES])
+                dc_log["dc/angle"] = float(dc0[NUM_FACES + 1])
+                wandb.log({**c_log, **dc_log}, step=it)
 
         # Log results for plotting
         #
         means.append(float(np.nanmean(final_dists_np)))
         stds.append(float(np.nanstd(final_dists_np)))
-        if random_mean is not None and random_std is not None:
-            random_means.append(random_mean)
-            random_stds.append(random_std)
+        if mean_pct_vs_baseline is not None and pct_vs_baseline is not None:
+            random_means.append(mean_pct_vs_baseline)
+            random_stds.append(float(np.nanstd(pct_vs_baseline)))
         dist_delta_hist.append(final_dists_np - initial_final_dists)
         face_hist.append(face_hist_current)
         cp_hist.append(cp_hist_current)
@@ -814,6 +878,8 @@ def main(
                 save_filepath2=save_dir / f"latest.png",
                 open_after_save=False,
             )
+            if use_wandb:
+                wandb.log({"plot": wandb.Image(str(save_dir / "latest.png"))}, step=it)
         if mean_dist < lowest_mean_dist:
             lowest_mean_dist = mean_dist
             cprint(f"New lowest mean dist: {lowest_mean_dist:.5f} [m]", "green")
@@ -830,11 +896,15 @@ def main(
             save_filepath = save_dir / f"{it + 1:03d}.mp4"
             env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
             print(f"  Saved video to {save_filepath}")
+            if use_wandb:
+                wandb.log({"video": wandb.Video(str(save_filepath))}, step=it)
 
         if it == 0:
             cprint(f"First iteration time: {time() - t_start:.2f} s", "yellow")
 
     cprint(f"\nOptimization took {time() - t_start:.2f} s total", "green")
+    if use_wandb:
+        wandb.finish()
 
     # ── Plots ──────────────────────────────────────────────────────────────────
     plot_results(
@@ -866,6 +936,7 @@ if __name__ == "__main__":
     parser.add_argument("--multi-step-n-actions", type=int)
     parser.add_argument("--disable-random", action="store_true", help="Skip random action baseline sampling")
     parser.add_argument("--relative-coordinates", action="store_true", help="Use relative coordinates")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     assert args.n_envs is not None, "n_envs must be specified"
@@ -878,4 +949,5 @@ if __name__ == "__main__":
         multi_step_n_actions=args.multi_step_n_actions,
         disable_random=args.disable_random,
         relative_coordinates=args.relative_coordinates,
+        use_wandb=not args.no_wandb,
     )

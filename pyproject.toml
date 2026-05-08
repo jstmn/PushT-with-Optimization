@@ -22,7 +22,8 @@ dependencies = [
     "imageio[ffmpeg]",
     "termcolor",
     "gurobipy",
-    "tqdm"
+    "tqdm",
+    "wandb"
 ]
 
 [project.optional-dependencies]

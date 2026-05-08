@@ -59,7 +59,9 @@ def _evaluated_sequence_from_payload(payload: dict) -> EvaluatedSequence:
 
 
 def build_action_grid(contact_point_bins: int, angle_bins: int) -> list[ActionSpec]:
-    contact_points = np.linspace(CONTACT_POINT_BOUNDS[0], CONTACT_POINT_BOUNDS[1], num=contact_point_bins, dtype=np.float32)
+    contact_points = np.linspace(
+        CONTACT_POINT_BOUNDS[0], CONTACT_POINT_BOUNDS[1], num=contact_point_bins, dtype=np.float32
+    )
     angles = np.linspace(float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1]), num=angle_bins, dtype=np.float32)
 
     grid: list[ActionSpec] = []
@@ -402,7 +404,9 @@ python scripts/results_single_env_multistep.py \
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=0, help="Seed for the single environment and random action sampling")
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Seed for the single environment and random action sampling"
+    )
     parser.add_argument("--random-sample-k", type=int, help="Number of random action sequences to sample")
     parser.add_argument(
         "--contact-point-bins",

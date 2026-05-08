@@ -709,8 +709,10 @@ class PushTEnv:
     frame, not the global frame.
     """
 
-    def __init__(self, nenvs: int, use_relative_coordinates: bool = False, record_video: bool = False, visualize: bool = False):
-        assert abs(nenvs - int(jnp.sqrt(nenvs))**2) < 1e-6, f"nenvs must be a perfect square, got {nenvs}"
+    def __init__(
+        self, nenvs: int, use_relative_coordinates: bool = False, record_video: bool = False, visualize: bool = False
+    ):
+        # assert abs(nenvs - int(jnp.sqrt(nenvs))**2) < 1e-6, f"nenvs must be a perfect square, got {nenvs}"
         self._nenvs = nenvs
         self._use_relative_coordinates = use_relative_coordinates
         self._record_video = record_video
@@ -843,7 +845,7 @@ class PushTEnv:
                 data=self._mj_multi_data,
                 fps=int(1 / self._model.time_step / 12),
                 width=2512,
-                height=2512
+                height=2512,
             )
 
     @property

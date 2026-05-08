@@ -37,7 +37,9 @@ class IterationRecord:
 
 
 def build_action_grid(contact_point_bins: int, angle_bins: int) -> list[tuple[int, float, float]]:
-    contact_points = np.linspace(CONTACT_POINT_BOUNDS[0], CONTACT_POINT_BOUNDS[1], num=contact_point_bins, dtype=np.float32)
+    contact_points = np.linspace(
+        CONTACT_POINT_BOUNDS[0], CONTACT_POINT_BOUNDS[1], num=contact_point_bins, dtype=np.float32
+    )
     angles = np.linspace(float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1]), num=angle_bins, dtype=np.float32)
 
     grid: list[tuple[int, float, float]] = []
@@ -61,7 +63,9 @@ def rollout_action(env: PushTEnv, seed: int, face: int, contact_point: float, an
     return float(t_distances[0]), float(t_distances[-1])
 
 
-def evaluate_optimal_action(env: PushTEnv, seed: int, action_grid: list[tuple[int, float, float]]) -> tuple[EvaluatedAction, float]:
+def evaluate_optimal_action(
+    env: PushTEnv, seed: int, action_grid: list[tuple[int, float, float]]
+) -> tuple[EvaluatedAction, float]:
     best_action: EvaluatedAction | None = None
     starting_distance: float | None = None
     for face, contact_point, angle in tqdm(action_grid, desc="Optimal actions", unit="action"):
@@ -221,7 +225,6 @@ def main(
     random_mean_final_distance = float(np.mean(random_final_distances))
     random_std_final_distance = float(np.std(random_final_distances))
 
-
     filename = f"results__k:{random_sample_k}__cp-bins:{contact_point_bins}__ang-bins:{angle_bins}__seed:{seed}"
     plot_path = save_dir / f"{filename}.png"
     video_path = save_dir / f"{filename}__optimal.mp4"
@@ -290,8 +293,12 @@ python scripts/results_single_env.py --seed 0 --random-sample-k 50 --contact-poi
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=0, help="Seed for the single environment and random action sampling")
-    parser.add_argument("--random-sample-k", type=int, default=50, help="Number of random actions to sample and roll out")
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Seed for the single environment and random action sampling"
+    )
+    parser.add_argument(
+        "--random-sample-k", type=int, default=50, help="Number of random actions to sample and roll out"
+    )
     parser.add_argument(
         "--contact-point-bins",
         type=int,
