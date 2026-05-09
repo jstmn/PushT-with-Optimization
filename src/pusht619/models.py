@@ -35,7 +35,6 @@ _mid_cp = 0.5 * (_lo_cp + _hi_cp)
 _mid_ang = 0.5 * (_lo_ang + _hi_ang)
 
 
-
 class ActionSolver:
     """Gurobi solver matching the training-time objective."""
 

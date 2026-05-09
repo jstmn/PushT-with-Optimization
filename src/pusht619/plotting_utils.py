@@ -137,16 +137,16 @@ def plot_results(
 
 
 def plot_perturbation_hist(
-    c: np.ndarray,        # (n_envs, ACTION_DIM)
-    c_pert_ks: list,      # M x (n_envs, ACTION_DIM)
-    x_ks: list,           # M x (n_envs, ACTION_DIM)
-    x_star: np.ndarray,   # (n_envs, ACTION_DIM)
+    c: np.ndarray,  # (n_envs, ACTION_DIM)
+    c_pert_ks: list,  # M x (n_envs, ACTION_DIM)
+    x_ks: list,  # M x (n_envs, ACTION_DIM)
+    x_star: np.ndarray,  # (n_envs, ACTION_DIM)
     n_envs: int,
     iteration: int,
 ) -> plt.Figure:
     c_np = np.asarray(c)
-    c_pert_all = np.stack([np.asarray(ck) for ck in c_pert_ks])   # (M, n_envs, ACTION_DIM)
-    x_all = np.stack([np.asarray(xk) for xk in x_ks])             # (M, n_envs, ACTION_DIM)
+    c_pert_all = np.stack([np.asarray(ck) for ck in c_pert_ks])  # (M, n_envs, ACTION_DIM)
+    x_all = np.stack([np.asarray(xk) for xk in x_ks])  # (M, n_envs, ACTION_DIM)
     x_star_np = np.asarray(x_star)
 
     lo_cp, hi_cp = CONTACT_POINT_BOUNDS
@@ -178,8 +178,7 @@ def plot_perturbation_hist(
         # ── argmax face bar chart ──────────────────────────────────────
         ax_face = axes[row, NUM_FACES]
         face_choices_env = np.argmax(x_all[:, env_i, :NUM_FACES], axis=-1)
-        ax_face.bar(range(NUM_FACES), np.bincount(face_choices_env, minlength=NUM_FACES),
-                    color="steelblue", alpha=0.7)
+        ax_face.bar(range(NUM_FACES), np.bincount(face_choices_env, minlength=NUM_FACES), color="steelblue", alpha=0.7)
         chosen = int(np.argmax(x_star_np[env_i, :NUM_FACES]))
         ax_face.axvline(chosen, color="red", linewidth=1.5, label="x_star")
         ax_face.set_xticks(range(NUM_FACES))
@@ -212,12 +211,12 @@ def plot_perturbation_hist(
 
 
 def plot_network_output_hist(
-    c: np.ndarray,       # (n_envs, ACTION_DIM)
+    c: np.ndarray,  # (n_envs, ACTION_DIM)
     x_star: np.ndarray,  # (n_envs, ACTION_DIM)
     iteration: int,
 ) -> plt.Figure:
     """Histogram of raw network outputs across environments — same column layout as plot_perturbation_hist."""
-    c_np = np.asarray(c)       # (n_envs, ACTION_DIM)
+    c_np = np.asarray(c)  # (n_envs, ACTION_DIM)
     x_np = np.asarray(x_star)  # (n_envs, ACTION_DIM)
 
     lo_cp, hi_cp = CONTACT_POINT_BOUNDS

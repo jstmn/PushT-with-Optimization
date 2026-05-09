@@ -134,6 +134,7 @@ _DIST_CORNERS_JAX = jnp.asarray(T_CORNERS[[0, 3, 4, 7]])  # (4, 2) p0, p3, p4, p
 
 CONTEXT_DIM_RELATIVE = 4
 
+
 def _plan_push_jax(
     t_poses: jnp.ndarray,  # (nenvs, 3)  [x, y, theta]
     face: jnp.ndarray,  # (nenvs,) int
@@ -910,7 +911,9 @@ class PushTEnv:
                 [rel_x, rel_y, rel_vx, rel_vy],
                 axis=-1,
             )
-            assert ctx.shape == (self.nenvs, CONTEXT_DIM_RELATIVE), f"ctx must be ({self.nenvs}, {CONTEXT_DIM_RELATIVE}), got {ctx.shape}"
+            assert ctx.shape == (self.nenvs, CONTEXT_DIM_RELATIVE), (
+                f"ctx must be ({self.nenvs}, {CONTEXT_DIM_RELATIVE}), got {ctx.shape}"
+            )
             return ctx
 
         else:
