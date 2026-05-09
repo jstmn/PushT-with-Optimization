@@ -1,20 +1,9 @@
 from __future__ import annotations
 
-from time import time
-
-PROGRAM_START_TIME = time()
-from datetime import datetime
 from pathlib import Path
-from typing import Sequence
 
-import matplotlib.pyplot as plt
-from termcolor import cprint
-import jax
-
-jax.config.update("jax_compilation_cache_dir", str(Path.home() / ".cache/jax_pusht619"))
-import jax.numpy as jnp
 import numpy as np
-import argparse
+import jax.numpy as jnp
 import gurobipy as gp
 from gurobipy import GRB
 
@@ -44,78 +33,6 @@ _lo_cp, _hi_cp = CONTACT_POINT_BOUNDS
 _lo_ang, _hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
 _mid_cp = 0.5 * (_lo_cp + _hi_cp)
 _mid_ang = 0.5 * (_lo_ang + _hi_ang)
-
-
-# ── MLP: y → c ────────────────────────────────────────────────────────────────
-
-
-class MLP:
-    """Maps context y → solver parameters c.
-
-    Each 8-D output block stores:
-
-    c[:6]  = face cost coefficients (logits)
-    c[6]   = shared contact_point target, squashed into CONTACT_POINT_BOUNDS
-    c[7]   = shared angle target, squashed into ANGLE_BOUNDS
-
-    ``output_dim`` may contain one block (single-step) or multiple consecutive
-    blocks (multi-step). Params: list of (W, b) tuples — plain JAX pytree,
-    jit/grad compatible.
-    """
-
-    def __init__(self, context_dim: int, hidden_dims: Sequence[int] = (128, 128), output_dim: int = NUM_FACES + 2):
-        self.layer_sizes = [context_dim, *hidden_dims, output_dim]
-        self.cp_bounds = (_lo_cp, _hi_cp)
-        self.ang_bounds = (_lo_ang, _hi_ang)
-
-    def init(self, key: jax.Array) -> list[tuple[jnp.ndarray, jnp.ndarray]]:
-        params = []
-        for i in range(len(self.layer_sizes) - 1):
-            key, subkey = jax.random.split(key)
-            fan_in, fan_out = self.layer_sizes[i], self.layer_sizes[i + 1]
-            w = jax.random.normal(subkey, (fan_in, fan_out), dtype=jnp.float32) * jnp.sqrt(2.0 / fan_in)
-            b = jnp.zeros(fan_out, dtype=jnp.float32)
-            params.append((w, b))
-        return params
-
-    def apply(self, params: list[tuple[jnp.ndarray, jnp.ndarray]], x: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass. Returns bounded solver parameters in 8-D blocks.
-
-        The continuous heads use a tanh-centered parameterization, so a zero
-        pre-activation maps to the midpoint of each valid range.
-        """
-        for i, (w, b) in enumerate(params):
-            x = x @ w + b
-            if i < len(params) - 1:
-                x = jax.nn.relu(x)
-        if x.shape[-1] % (NUM_FACES + 2) != 0:
-            raise ValueError(f"output_dim must be divisible by {NUM_FACES + 2}, got {x.shape[-1]}")
-        x = x.reshape(x.shape[0], -1, NUM_FACES + 2)
-        face_logits = x[:, :, :NUM_FACES]
-        cp_lo, cp_hi = self.cp_bounds
-        ang_lo, ang_hi = self.ang_bounds
-        cp_mid = 0.5 * (cp_lo + cp_hi)
-        cp_half_range = 0.5 * (cp_hi - cp_lo)
-        ang_mid = 0.5 * (ang_lo + ang_hi)
-        ang_half_range = 0.5 * (ang_hi - ang_lo)
-        cp_target = cp_mid + cp_half_range * jnp.tanh(x[:, :, NUM_FACES : NUM_FACES + 1])
-        ang_target = ang_mid + ang_half_range * jnp.tanh(x[:, :, NUM_FACES + 1 : NUM_FACES + 2])
-        out = jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
-        return out.reshape(out.shape[0], -1)
-
-    def save_mlp_weights(self, filepath: Path, params: list[tuple[jnp.ndarray, jnp.ndarray]]) -> Path:
-        """Save MLP weights, biases, and output limits for one training iteration."""
-        cp_lo, cp_hi = self.cp_bounds
-        ang_lo, ang_hi = self.ang_bounds
-        arrays = {
-            "cp_bounds": np.asarray([cp_lo, cp_hi], dtype=np.float32),
-            "ang_bounds": np.asarray([ang_lo, ang_hi], dtype=np.float32),
-            "layer_sizes": np.asarray(self.layer_sizes, dtype=np.int32),
-        }
-        for layer_idx, (w, b) in enumerate(params):
-            arrays[f"layer_{layer_idx}_w"] = np.asarray(w)
-            arrays[f"layer_{layer_idx}_b"] = np.asarray(b)
-        np.savez(filepath, **arrays)
 
 
 class ActionSolver:
@@ -195,6 +112,7 @@ class ActionSolverMultiStep:
             self.xf.append(self.model.addVars(NUM_FACES, vtype=GRB.BINARY, name=f"xf_{m}"))
             self.cp.append(self.model.addVar(lb=_lo_cp, ub=_hi_cp, vtype=GRB.CONTINUOUS, name=f"cp_{m}"))
             self.ang.append(self.model.addVar(lb=_lo_ang, ub=_hi_ang, vtype=GRB.CONTINUOUS, name=f"ang_{m}"))
+            self.model.addConstr(gp.quicksum(self.xf[m][i] for i in range(NUM_FACES)) == 1)
         self.model.update()
 
     def solve(self, c: np.ndarray) -> np.ndarray:

@@ -12,6 +12,7 @@ from pathlib import Path
 import copy
 from dataclasses import dataclass
 import functools
+import math
 from typing import Any
 
 import numpy as np
@@ -53,8 +54,8 @@ def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
 
 
 T_RADIUS = 0.15
-WORKSPACE_WIDTH = 1.5
-WORKSPACE_HEIGHT = 1.5
+WORKSPACE_WIDTH = 1
+WORKSPACE_HEIGHT = 1
 PUSHER_RADIUS = 0.01
 PUSHER_CLEARANCE = 0.005
 PUSHER_APPROACH_DISTANCE = 0.005  # 0.04
@@ -130,6 +131,8 @@ _FACE_START_POINTS_JAX = jnp.asarray(FACE_START_POINTS)
 _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 _T_CORNERS_JAX = jnp.asarray(T_CORNERS)  # (8, 2) body-frame corners
 _DIST_CORNERS_JAX = jnp.asarray(T_CORNERS[[0, 3, 4, 7]])  # (4, 2) p0, p3, p4, p7 used for the distance metric
+
+CONTEXT_DIM_RELATIVE = 4
 
 
 def _plan_push_jax(
@@ -709,11 +712,20 @@ class PushTEnv:
     frame, not the global frame.
     """
 
-    def __init__(self, nenvs: int, use_relative_coordinates: bool = False, record_video: bool = False, visualize: bool = False):
+    def __init__(
+        self,
+        nenvs: int,
+        random_mode: str,
+        use_relative_coordinates: bool,
+        record_video: bool = False,
+        visualize: bool = False,
+    ):
+        # assert abs(nenvs - int(jnp.sqrt(nenvs))**2) < 1e-6, f"nenvs must be a perfect square, got {nenvs}"
         self._nenvs = nenvs
         self._use_relative_coordinates = use_relative_coordinates
         self._record_video = record_video
         self._visualize = visualize
+        self._random_mode = random_mode
         self._visualizer = None
         self._viewer = None
         self._t_poses: np.ndarray = np.zeros((nenvs, 3), dtype=np.float32)
@@ -770,14 +782,14 @@ class PushTEnv:
             )
         )(jnp.vstack(subkeys))
 
-        row_length = int(jnp.sqrt(nenvs))
+        row_length = math.ceil(math.sqrt(nenvs))
         spacing = max(WORKSPACE_WIDTH, WORKSPACE_HEIGHT) * 1.2
         row_dist = spacing * (row_length - 1) / 2
         x, y = jnp.meshgrid(
             jnp.linspace(-row_dist, row_dist, num=row_length) if row_length > 1 else jnp.array([0.0]),
             jnp.linspace(-row_dist, row_dist, num=row_length) if row_length > 1 else jnp.array([0.0]),
         )
-        xy_coordinate = jnp.stack([x.flatten(), y.flatten()], axis=-1)
+        xy_coordinate = jnp.stack([x.flatten(), y.flatten()], axis=-1)[:nenvs]
         self._xy_centers = np.array(xy_coordinate)
         self._data = data_batch_t0.replace(
             model=self._model,
@@ -842,7 +854,7 @@ class PushTEnv:
                 data=self._mj_multi_data,
                 fps=int(1 / self._model.time_step / 12),
                 width=2512,
-                height=2512
+                height=2512,
             )
 
     @property
@@ -901,11 +913,14 @@ class PushTEnv:
             rel_theta = t_theta - target_theta
             rel_vx = vx * cos_t + vy * sin_t
             rel_vy = -vx * sin_t + vy * cos_t
-
-            return jnp.stack(
-                [target_x, target_y, target_theta, rel_x, rel_y, rel_theta, rel_vx, rel_vy, vtheta],
+            ctx = jnp.stack(
+                [rel_x, rel_y, rel_vx, rel_vy],
                 axis=-1,
             )
+            assert ctx.shape == (self.nenvs, CONTEXT_DIM_RELATIVE), (
+                f"ctx must be ({self.nenvs}, {CONTEXT_DIM_RELATIVE}), got {ctx.shape}"
+            )
+            return ctx
 
         else:
             return jnp.concatenate(
@@ -993,10 +1008,18 @@ class PushTEnv:
 
         # First, set randomized poses for the T and target T
         if target_poses is None:
-            self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
-            self._target_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
-            self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
-            self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+            if "random-target" in self._random_mode:
+                self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
+                self._target_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+                self._target_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+                self._target_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+            elif "fixed-target" in self._random_mode:
+                self._target_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
+                self._target_poses[:, 0] = WORKSPACE_WIDTH / 2.0
+                self._target_poses[:, 1] = WORKSPACE_HEIGHT / 2.0
+                self._target_poses[:, 2] = 0.0
+            else:
+                raise ValueError(f"Unknown random_mode for target: {self._random_mode}")
         else:
             assert target_poses.shape == (self._nenvs, 3), (
                 f"target_poses must be ({self._nenvs}, 3), got {target_poses.shape}"
@@ -1005,10 +1028,19 @@ class PushTEnv:
 
         #
         if t_poses is None:
-            self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
-            self._t_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
-            self._t_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
-            self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+            if "random-spawn" in self._random_mode:
+                self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
+                self._t_poses[:, 0] = rng.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+                self._t_poses[:, 1] = rng.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+                self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
+            elif "fixed-spawn" in self._random_mode:
+                self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
+                rng_fixed = np.random.default_rng(0)
+                self._t_poses[:, 0] = rng_fixed.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+                self._t_poses[:, 1] = rng_fixed.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+                self._t_poses[:, 2] = rng_fixed.uniform(-np.pi, np.pi, size=self._nenvs)
+            else:
+                raise ValueError(f"Unknown random_mode for spawn: {self._random_mode}")
         else:
             assert t_poses.shape == (self._nenvs, 3), f"t_poses must be ({self._nenvs}, 3), got {t_poses.shape}"
             self._t_poses = t_poses
