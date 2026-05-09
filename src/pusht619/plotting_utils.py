@@ -218,6 +218,7 @@ def plot_network_output_hist(
     """Histogram of raw network outputs across environments — same column layout as plot_perturbation_hist."""
     c_np = np.asarray(c)  # (n_envs, ACTION_DIM)
     x_np = np.asarray(x_star)  # (n_envs, ACTION_DIM)
+    n_envs = c_np.shape[0]
 
     lo_cp, hi_cp = CONTACT_POINT_BOUNDS
     lo_ang, hi_ang = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
@@ -239,6 +240,7 @@ def plot_network_output_hist(
     ax_face = axes[NUM_FACES]
     face_choices = np.argmax(x_np[:, :NUM_FACES], axis=-1)
     ax_face.bar(range(NUM_FACES), np.bincount(face_choices, minlength=NUM_FACES), color="steelblue", alpha=0.7)
+    ax_face.set_ylim(0, n_envs)
     ax_face.set_xticks(range(NUM_FACES))
     ax_face.set_title("chosen face", fontsize=8)
     ax_face.tick_params(labelsize=6)
@@ -254,6 +256,11 @@ def plot_network_output_hist(
     ax_ang.set_xlim(lo_ang, hi_ang)
     ax_ang.set_title("c_angle", fontsize=8)
     ax_ang.tick_params(labelsize=6)
+
+    for ax in axes:
+        ax.minorticks_on()
+        ax.set_axisbelow(True)
+        ax.grid(True, which="both", linestyle=":", alpha=0.5)
 
     fig.tight_layout()
     return fig
