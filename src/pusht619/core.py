@@ -54,8 +54,8 @@ def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
 
 
 T_RADIUS = 0.15
-WORKSPACE_WIDTH = 1.5
-WORKSPACE_HEIGHT = 1.5
+WORKSPACE_WIDTH = 1
+WORKSPACE_HEIGHT = 1
 PUSHER_RADIUS = 0.01
 PUSHER_CLEARANCE = 0.005
 PUSHER_APPROACH_DISTANCE = 0.005  # 0.04
@@ -132,6 +132,7 @@ _FACE_END_POINTS_JAX = jnp.asarray(FACE_END_POINTS)
 _T_CORNERS_JAX = jnp.asarray(T_CORNERS)  # (8, 2) body-frame corners
 _DIST_CORNERS_JAX = jnp.asarray(T_CORNERS[[0, 3, 4, 7]])  # (4, 2) p0, p3, p4, p7 used for the distance metric
 
+CONTEXT_DIM_RELATIVE = 4
 
 def _plan_push_jax(
     t_poses: jnp.ndarray,  # (nenvs, 3)  [x, y, theta]
@@ -905,11 +906,12 @@ class PushTEnv:
             rel_theta = t_theta - target_theta
             rel_vx = vx * cos_t + vy * sin_t
             rel_vy = -vx * sin_t + vy * cos_t
-
-            return jnp.stack(
-                [target_x, target_y, target_theta, rel_x, rel_y, rel_theta, rel_vx, rel_vy, vtheta],
+            ctx = jnp.stack(
+                [rel_x, rel_y, rel_vx, rel_vy],
                 axis=-1,
             )
+            assert ctx.shape == (self.nenvs, CONTEXT_DIM_RELATIVE), f"ctx must be ({self.nenvs}, {CONTEXT_DIM_RELATIVE}), got {ctx.shape}"
+            return ctx
 
         else:
             return jnp.concatenate(

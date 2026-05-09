@@ -57,7 +57,7 @@ System design (SurCo-prior):
 
 # --- Example usage
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
-unset LD_LIBRARY_PATH  # < note: this runs things with the gpu. Each iteration is ~1.5x slower though <shrug>
+unset LD_LIBRARY_PATH  # < note: this runs things with the gpu. Note that it's faster to run on the cpu with nenvs<4
 
 # Random t-pose
 python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --random-t-pose --record-video
@@ -65,7 +65,7 @@ python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --r
 python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --record-video
 python scripts/main_surco.py --n-envs 4 --relative-coordinates --verbosity 1 --record-video
 python scripts/main_surco.py --n-envs 4 --relative-coordinates --verbosity 1 --random-t-pose
-python scripts/main_surco.py --n-envs 64 --relative-coordinates --verbosity 1 --random-t-pose
+python scripts/main_surco.py --n-envs 32 --relative-coordinates --verbosity 1 --random-t-pose
 """
 
 from __future__ import annotations
@@ -90,8 +90,8 @@ import optax
 import flax.linen as nn
 import flax.traverse_util
 from pusht619.models import ActionSolver, ActionSolverMultiStep
-from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES
-from pusht619.plotting_utils import plot_results, plot_perturbation_hist
+from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES, CONTEXT_DIM_RELATIVE
+from pusht619.plotting_utils import plot_results, plot_perturbation_hist, plot_network_output_hist
 
 _CP_LO, _CP_HI = CONTACT_POINT_BOUNDS
 _ANG_LO, _ANG_HI = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
@@ -137,30 +137,34 @@ def save_mlp_weights(filepath: Path, params) -> None:
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-N_OPT_STEPS = 250
-LR = 0.1
+N_OPT_STEPS = 10000
+LR = 0.001
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
 M_ROLLOUTS = 9
-FACE_OUTPUT_REG_BETA = 0.05
+
+# Regularization scales
+FACE_OUTPUT_REG_BETA = 0.5
 CONTACT_POINT_REG_BETA = 0.1
 ANGLE_REG_BETA = 0.1
-# CONTACT_POINT_REG_BETA = 0.1
-# ANGLE_REG_BETA = 0.1
-# CONTACT_POINT_REG_BETA = 0.5
-# ANGLE_REG_BETA = 0.5
+
 CP_TARGET_WEIGHT = 1.0
 ANG_TARGET_WEIGHT = 1.0
-RANDOM_T_POSE_EVAL_EVERY = 25
-BASELINE_EVAL_EVERY = 5
+USE_MC_FOR_CONTINUOUS_GRADIENTS = False
+
 
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
 # Too large → x_k far from x*; gradient bias grows.
 PERTURB_LAMBDA = 1.25
+CONTINUOUS_PERTURB_SCALE = 0.1
 
+# Evaluation frequency cfg
+RANDOM_T_POSE_EVAL_EVERY = 25
+BASELINE_EVAL_EVERY = 5
 
+# 
 _SOLVER = ActionSolver()
 _ENV: PushTEnv | None = None
 _ENV_BACKWARD: PushTEnv | None = None
@@ -289,6 +293,8 @@ def _milp_backward(res, grad_x):
 
     key = sample_rng
     face_weights_ks: list = []
+    cp_ks_list: list = []
+    ang_ks_list: list = []
     eps_faces: list = []
     x_ks: list = []
     c_pert_ks: list = []
@@ -308,12 +314,14 @@ def _milp_backward(res, grad_x):
             )
             key, subkey = jax.random.split(key)
             eps_face = eps_face.at[:, lo + NUM_FACES : lo + NUM_FACES + 2].set(
-                0.1 * jax.random.normal(subkey, (n_envs, 2), dtype=jnp.float32)
+                CONTINUOUS_PERTURB_SCALE * jax.random.normal(subkey, (n_envs, 2), dtype=jnp.float32)
             )
         c_pert = (c + PERTURB_LAMBDA * eps_face).astype(jnp.float32)
         x_k = _solve_milp_pure_callback(c_pert)
         x_k_blocks = x_k.reshape(n_envs, n_actions, ACTION_DIM)
         face_weights_ks.append(x_k_blocks[:, :, :NUM_FACES])  # (N, n_actions, F) one-hot
+        cp_ks_list.append(x_k_blocks[:, :, NUM_FACES])
+        ang_ks_list.append(x_k_blocks[:, :, NUM_FACES + 1])
         eps_faces.append(eps_face)
         x_ks.append(x_k)
         c_pert_ks.append(c_pert)
@@ -325,10 +333,17 @@ def _milp_backward(res, grad_x):
     face_weights_all = jnp.concatenate(face_weights_ks, axis=0)   # (M*N, n_actions, F)
     data_tiled = jax.tree.map(lambda x: jnp.repeat(x, M_ROLLOUTS, axis=0), data)
 
+    cp_all = jnp.concatenate(cp_ks_list, axis=0)
+    ang_all = jnp.concatenate(ang_ks_list, axis=0)
+
     def all_rollouts_cost(cp, ang):
-        # cp: (N, n_actions) — tiled inside so grad flows back to this shape.
-        cp_tiled = jnp.repeat(cp, M_ROLLOUTS, axis=0)   # (M*N, n_actions)
-        ang_tiled = jnp.repeat(ang, M_ROLLOUTS, axis=0)
+        if USE_MC_FOR_CONTINUOUS_GRADIENTS:
+            cp_tiled = cp
+            ang_tiled = ang
+        else:
+            # cp: (N, n_actions) — tiled inside so grad flows back to this shape.
+            cp_tiled = jnp.repeat(cp, M_ROLLOUTS, axis=0)   # (M*N, n_actions)
+            ang_tiled = jnp.repeat(ang, M_ROLLOUTS, axis=0)
         _, t_dists, _ = _run_rollout(face_weights_all, cp_tiled, ang_tiled, data_tiled, _ENV_BACKWARD)
         # t_dists: (M*N, total_steps) → per-rollout costs (M, N)
         costs_per_env = t_dists[:, -1].reshape(M_ROLLOUTS, n_envs)
@@ -337,9 +352,12 @@ def _milp_backward(res, grad_x):
 
     # One parallel backward pass: mc_rollout_costs_per_perturbation for MC face estimator, grads for continuous.
     t_physics_start = time()
-    (_, (mc_rollout_costs_per_perturbation, costs_per_env_all)), (grad_cp_0, grad_ang_0) = jax.value_and_grad(
-        all_rollouts_cost, argnums=(0, 1), has_aux=True
-    )(cp_0, ang_0)
+    if USE_MC_FOR_CONTINUOUS_GRADIENTS:
+        (_, (mc_rollout_costs_per_perturbation, costs_per_env_all)) = all_rollouts_cost(cp_all, ang_all)
+    else:
+        (_, (mc_rollout_costs_per_perturbation, costs_per_env_all)), (grad_cp_0, grad_ang_0) = jax.value_and_grad(
+            all_rollouts_cost, argnums=(0, 1), has_aux=True
+        )(cp_0, ang_0)
     t_physics = time() - t_physics_start
     global _LAST_BACKWARD_T_GUROBI_MS, _LAST_BACKWARD_T_PHYSICS_MS
     _LAST_BACKWARD_T_GUROBI_MS = t_gurobi * 1000
@@ -348,19 +366,40 @@ def _milp_backward(res, grad_x):
 
     # Face MC gradient — mean-baseline control variate reduces variance.
     mc_rollout_cost_mean = mc_rollout_costs_per_perturbation.mean()
+    mean_cost_per_env = jnp.nanmean(costs_per_env_all, axis=0)
     grad_c_face = jnp.zeros_like(c)
+    grad_c_mc_cont = jnp.zeros_like(c)
+    
     for k_i in range(M_ROLLOUTS):
-        grad_c_face = grad_c_face + eps_faces[k_i] * (mc_rollout_costs_per_perturbation[k_i] - mc_rollout_cost_mean)
-    grad_c_face = grad_c_face / (M_ROLLOUTS * PERTURB_LAMBDA)
+        # We divide diff by n_envs because task_loss is a mean over all envs,
+        # so the gradient of the task_loss is 1/N * gradient of the env cost.
+        diff = (costs_per_env_all[k_i] - mean_cost_per_env) / n_envs
+        eps_f = eps_faces[k_i]
+        
+        for action_idx in range(n_actions):
+            lo = action_idx * ACTION_DIM
+            
+            grad_c_face = grad_c_face.at[:, lo : lo + NUM_FACES].add(
+                eps_f[:, lo : lo + NUM_FACES] * diff[:, None] / (M_ROLLOUTS * PERTURB_LAMBDA)
+            )
+            
+            if USE_MC_FOR_CONTINUOUS_GRADIENTS:
+                # eps_f for continuous was scaled by CONTINUOUS_PERTURB_SCALE, true_eps = eps_f / CONTINUOUS_PERTURB_SCALE
+                # The injected noise std dev = CONTINUOUS_PERTURB_SCALE * PERTURB_LAMBDA
+                # grad = true_eps / std * cost = eps_f / (CONTINUOUS_PERTURB_SCALE**2 * PERTURB_LAMBDA) * cost
+                grad_c_mc_cont = grad_c_mc_cont.at[:, lo + NUM_FACES : lo + NUM_FACES + 2].add(
+                    eps_f[:, lo + NUM_FACES : lo + NUM_FACES + 2] * diff[:, None] / (M_ROLLOUTS * PERTURB_LAMBDA * (CONTINUOUS_PERTURB_SCALE**2))
+                )
 
-    # Continuous gradient: map (N, n_actions) grad arrays back into the c layout.
-    # grad_c_continuous = jnp.zeros_like(c)
-    # for action_idx in range(n_actions):
-    #     lo = action_idx * ACTION_DIM
-    #     grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES].set(grad_cp_0[:, action_idx])
-    #     grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES + 1].set(grad_ang_0[:, action_idx])
-    # grad_c = grad_c_face + grad_c_continuous
-    grad_c = grad_c_face
+    if USE_MC_FOR_CONTINUOUS_GRADIENTS:
+        grad_c = grad_c_face + grad_c_mc_cont
+    else:
+        grad_c_continuous = jnp.zeros_like(c)
+        for action_idx in range(n_actions):
+            lo = action_idx * ACTION_DIM
+            grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES].set(grad_cp_0[:, action_idx])
+            grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES + 1].set(grad_ang_0[:, action_idx])
+        grad_c = grad_c_face + grad_c_continuous
 
     if verbosity > 0:
         jax.debug.print("  mc_rollout_cost_mean={mc_rollout_cost_mean}", mc_rollout_cost_mean=mc_rollout_cost_mean)
@@ -391,7 +430,7 @@ def _milp_backward(res, grad_x):
 
     if wandb.run is not None and _CURRENT_ITERATION >= 0 and (_CURRENT_ITERATION % BASELINE_EVAL_EVERY) == 0:
         fig = plot_perturbation_hist(c, c_pert_ks, x_ks, x_star, n_envs, _CURRENT_ITERATION)
-        wandb.log({"c_figures/perturbation_hist": wandb.Image(fig)}, step=_CURRENT_ITERATION)
+        wandb.log({"milp_backward/c_perturbation_hist": wandb.Image(fig)}, step=_CURRENT_ITERATION)
         plt.close(fig)
 
     return (grad_c, None, None, None)
@@ -400,12 +439,11 @@ def _milp_backward(res, grad_x):
 milp_solver.defvjp(_milp_forward, _milp_backward)
 
 
-
 def save_json(
     iteration_json_path,
     iteration,
     loss,
-    mean_dist,
+    mean_final_dist,
     final_dists_np,
     c_batch,
     x_batch,
@@ -417,7 +455,7 @@ def save_json(
     iteration_payload = {
         "iteration": iteration,
         "loss": float(loss),
-        "mean_final_distance": mean_dist,
+        "mean_final_distance": mean_final_dist,
         "final_distance_per_env": final_dists_np.tolist(),
         "c": np.asarray(c_batch).tolist(),
         "x": x_batch.tolist(),
@@ -504,6 +542,7 @@ def main(
             project="pusht619-surco",
             name=save_dir.name,
             config=dict(
+                continuous_grad_from_mc=USE_MC_FOR_CONTINUOUS_GRADIENTS,
                 n_envs=n_envs,
                 lr=LR,
                 n_opt_steps=N_OPT_STEPS,
@@ -523,7 +562,7 @@ def main(
         )
 
     mlp = SurCoMLP(hidden_dims=(128, 128), output_dim=solver_output_dim)
-    params = mlp.init(jax.random.PRNGKey(0), jnp.zeros((1, 9)))
+    params = mlp.init(jax.random.PRNGKey(0), jnp.zeros((1, CONTEXT_DIM_RELATIVE)))
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adam(LR),
@@ -534,43 +573,21 @@ def main(
         if n_envs > 1:
             def _check_c(c_np):
                 if np.all(c_np[0] == c_np[1]):
-                    print(f"[CHECK FAIL] c is identical across envs: {c_np[0]}")
-                else:
-                    print(f"[CHECK OK] c differs:  env0={c_np[0]}  env1={c_np[1]}")
+                    print(f"[CHECK FAIL] c is identical across envs: {c_np}")
+                    assert False
+                # else:
+                #     print(f"[CHECK OK] c differs")
             jax.debug.callback(_check_c, c)
 
         # Do one clean forward solve/rollout. The M_ROLLOUTS Monte Carlo rollouts
         # used for gradient estimation live in milp_solver's custom VJP.
         x_star = milp_solver(c, data, rng_solve, solver_verbosity)  # (n_envs, action_dim)
-
-        if n_envs > 1:
-            def _check_x_star(x_np):
-                if np.all(x_np[0] == x_np[1]):
-                    print(f"[CHECK FAIL] x_star is identical across envs: {x_np[0]}")
-                else:
-                    print(f"[CHECK OK] x_star differs: env0={x_np[0]}  env1={x_np[1]}")
-            jax.debug.callback(_check_x_star, x_star)
-
         x_star_blocks = x_star.reshape((x_star.shape[0], n_actions, ACTION_DIM))
         c_blocks = c.reshape((c.shape[0], n_actions, ACTION_DIM))
         face_weights = x_star_blocks[:, :, :NUM_FACES]
         contact_points = x_star_blocks[:, :, NUM_FACES]
         angles = x_star_blocks[:, :, NUM_FACES + 1]
         face_idx = jnp.argmax(face_weights, axis=-1)
-
-        if log_forward and verbosity > 0:
-            jax.debug.print("rollout action")
-            jax.debug.print(
-                "|__ face={face}\n|__ contact_point (lims: {lo_cp:.3f}, {hi_cp:.3f})={cp}\n|__ angle (lims: {lo_ang:.3f}, {hi_ang:.3f})={a}",
-                face=face_idx,
-                cp=contact_points,
-                a=angles,
-                lo_cp=CONTACT_POINT_BOUNDS[0],
-                hi_cp=CONTACT_POINT_BOUNDS[1],
-                lo_ang=ANGLE_BOUNDS[0],
-                hi_ang=ANGLE_BOUNDS[1],
-            )
-            jax.debug.print("|__")
 
         face_weights_in = jax.nn.one_hot(face_idx, NUM_FACES)
         task_loss, t_distances, jpos_traj = _run_rollout(face_weights_in, contact_points, angles, data)
@@ -665,10 +682,10 @@ def main(
     c_face_hist = []  # list of (n_envs, NUM_FACES) float — face logits per env per iter
 
     n_envs_better_0 = None
-    initial_mean_dist = None
+    initial_mean_final_dist = None
     initial_final_dists = None
     initial_faces = None
-    lowest_mean_dist = float("inf")
+    lowest_mean_final_dist = float("inf")
     t_start = time()
 
     for it in range(N_OPT_STEPS):
@@ -676,8 +693,11 @@ def main(
         if it == 0:
             print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
 
+
         print()
-        print(f"|  ===  iter {it + 1:2d}  ===  |")
+        print(f"|  -------------------------------------------------------------------------------------------  |")
+        print(f"|  ------------------------------------------  iter {it + 1:2d}  ------------------------------------------  |")
+        print()
 
         is_eval_step = (it % RANDOM_T_POSE_EVAL_EVERY) == 0
         if random_t_pose:
@@ -697,8 +717,9 @@ def main(
             jp_dupes = [i for i in range(1, n_envs) if np.all(jp[i] == jp[0])]
             if jp_dupes:
                 cprint(f"[CHECK FAIL] joint_positions identical to env0 for envs: {jp_dupes}", "red")
-            else:
-                cprint(f"[CHECK OK] joint_positions differ across all envs", "green")
+                assert False
+            # else:
+            #     cprint(f"[CHECK OK] joint_positions differ across all envs", "green")
 
             t_poses_np = env.t_poses
             tgt_poses_np = env.target_poses
@@ -706,22 +727,25 @@ def main(
             tgt_dupes = [i for i in range(1, n_envs) if np.all(tgt_poses_np[i] == tgt_poses_np[0])]
             if t_dupes:
                 cprint(f"[CHECK FAIL] t_poses identical to env0 for envs: {t_dupes}  values: {t_poses_np}", "red")
-            else:
-                cprint(f"[CHECK OK] t_poses all differ", "green")
+            # else:
+            #     cprint(f"[CHECK OK] t_poses all differ", "green")
             if tgt_dupes:
                 cprint(f"[CHECK FAIL] target_poses identical to env0 for envs: {tgt_dupes}  values: {tgt_poses_np}", "red")
-            else:
-                cprint(f"[CHECK OK] target_poses all differ", "green")
+                assert False
+            # else:
+            #     cprint(f"[CHECK OK] target_poses all differ", "green")
             if np.all(tgt_poses_np[0] == tgt_poses_np[1]):
                 cprint(f"[CHECK FAIL] target_poses identical: {tgt_poses_np}", "red")
-            else:
-                cprint(f"[CHECK OK] target_poses differ: env0={tgt_poses_np[0]}  env1={tgt_poses_np[1]}", "green")
+                assert False
+            # else:
+            #     cprint(f"[CHECK OK] target_poses differ: env0={tgt_poses_np[0]}  env1={tgt_poses_np[1]}", "green")
 
             xy = env._xy_centers
             if np.all(xy[0] == xy[1]):
                 cprint(f"[CHECK FAIL] _xy_centers identical: {xy}", "red")
-            else:
-                cprint(f"[CHECK OK] _xy_centers differ: env0={xy[0]}  env1={xy[1]}", "green")
+                assert False
+            # else:
+            #     cprint(f"[CHECK OK] _xy_centers differ: env0={xy[0]}  env1={xy[1]}", "green")
 
         step_key = jax.random.PRNGKey(it)
         (loss, (t_distances, jpos_traj, face_weights, cp_batch, ang_batch, c_batch, task_loss, face_logit_regularization, cp_regularization, angle_regularization)), g_raw = loss_and_grad_wrt_params(
@@ -741,7 +765,9 @@ def main(
 
         final_dists_np = np.asarray(t_distances[:, -1])
         initial_dists_np = np.asarray(t_distances[:, 0])
-        mean_dist = float(np.nanmean(final_dists_np))
+        mean_final_dist = float(np.nanmean(final_dists_np))
+        mean_initial_dist = float(np.nanmean(initial_dists_np))
+        mean_dist_change = mean_final_dist - mean_initial_dist
         face_idx_np = np.asarray(jnp.argmax(face_weights, axis=-1))
         face_hist_current = face_idx_np[:, 0] if is_multi_step else face_idx_np
         cp_hist_current = np.asarray(cp_batch[:, 0] if is_multi_step else cp_batch)
@@ -771,33 +797,33 @@ def main(
 
         # Print results
         #
-        if initial_mean_dist is None:
-            initial_mean_dist = float(np.nanmean(initial_dists_np))
+        if initial_mean_final_dist is None:
+            initial_mean_final_dist = float(np.nanmean(initial_dists_np))
         if initial_final_dists is None:
             initial_final_dists = final_dists_np.copy()
         if initial_faces is None:
             initial_faces = face_idx_np.copy()
-        if random_t_pose:
+        if not random_t_pose:
             if is_eval_step:
                 cprint(f"|____ eval step: using environment from iteration 0", "cyan")
-        if n_envs_better_0 is None:
-            n_envs_better_0 = sum(final_dists_np < initial_mean_dist - 0.05)
-        delta_cm = 100 * (mean_dist - initial_mean_dist)
-        initial_str = f" | initial mean @ t=0: {initial_mean_dist:.5f} [m]" if not random_t_pose else ""
-        cprint(
-            f"|____ mean dist: {mean_dist:.5f} [m] | delta from initial: {delta_cm:.3f} [cm]{initial_str} | {dt * 1000:.1f} ms",
-            "green" if delta_cm < 0 else "red",
-        )
-        n_envs_better = sum(final_dists_np < initial_mean_dist - 0.05)
-        cprint(
-            f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}",
-            "green" if n_envs_better > n_envs_better_0 else "red",
-        )
-        cprint(f"|____ face initial= {initial_faces.tolist()}", "yellow")
-        cprint(f"|____ face current= {face_idx_np.tolist()}", "yellow")
-        cprint(f"|____ face diff=    {(face_idx_np - initial_faces).tolist()}", "yellow")
-        cprint(f"|____ angles=       {ang_hist_current.tolist()}", "yellow")
-        cprint(f"|____ contact-point={cp_hist_current.tolist()}", "yellow")
+            if n_envs_better_0 is None:
+                n_envs_better_0 = sum(final_dists_np < initial_mean_final_dist - 0.05)
+            delta_cm = 100 * (mean_final_dist - initial_mean_final_dist)
+            initial_str = f" | initial mean @ t=0: {initial_mean_final_dist:.5f} [m]" if not random_t_pose else ""
+            cprint(
+                f"|____ mean_final_dist: {mean_final_dist:.5f} [m] | mean_dist_change: {mean_dist_change*100:.3f} [cm] | delta from t=0: {delta_cm:.3f} [cm]{initial_str} | {dt * 1000:.1f} ms",
+                "green" if mean_dist_change < 0 else "red",
+            )
+            n_envs_better = sum(final_dists_np < initial_mean_final_dist - 0.05)
+            cprint(
+                f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}",
+                "green" if n_envs_better > n_envs_better_0 else "red",
+            )
+        print(f"|____ face initial= {initial_faces[:, 0]}")
+        print(f"|____ face current= {face_idx_np[:, 0]}")
+        print(f"|____ face diff=    {(face_idx_np - initial_faces)[:, 0]}")
+        print(f"|____ angles=       {ang_hist_current[:, 0]}")
+        print(f"|____ contact-point={cp_hist_current[:, 0]}")
         if verbosity > 1:
             cprint(f"|____ c=           {np.asarray(c_batch).tolist()}", "yellow")
             # cprint(f"|____ dloss/dc=    {grad_c.tolist()}", "yellow")
@@ -832,7 +858,7 @@ def main(
             iterations_dir / f"{it:03d}.json",
             it,
             loss,
-            mean_dist,
+            mean_final_dist,
             final_dists_np,
             c_batch,
             x_batch,
@@ -854,11 +880,13 @@ def main(
         if use_wandb:
             wandb_payload: dict = {
                 "loss": float(loss),
+                "loss/total": float(loss),
                 "loss/task": float(task_loss),
                 "loss/face_logit_regularization": float(face_logit_regularization),
                 "loss/cp_regularization": float(cp_regularization),
                 "loss/angle_regularization": float(angle_regularization),
-                "mean_final_dist": mean_dist,
+                "mean_final_dist": mean_final_dist,
+                "mean_dist_change": mean_dist_change,
                 "std_final_dist": float(np.nanstd(final_dists_np)),
                 "n_nan_envs": len(nan_envs),
                 "n_bad_grads": n_bad_grads,
@@ -870,7 +898,7 @@ def main(
                 # "time/grad_c_ms": t_grad_c * 1000,
                 "time/optimizer_ms": t_optimizer * 1000,
                 "time/baseline_ms": t_baseline * 1000,
-                "n_envs_better": int(n_envs_better),
+                # "n_envs_better": int(n_envs_better),
             }
             if mean_pct_vs_baseline is not None and pct_vs_baseline is not None:
                 wandb_payload["mean_pct_vs_baseline"] = mean_pct_vs_baseline
@@ -941,10 +969,13 @@ def main(
             )
             if use_wandb:
                 wandb.log({"plot": wandb.Image(str(save_dir / "latest.png"))}, step=it)
-        if mean_dist < lowest_mean_dist:
-            lowest_mean_dist = mean_dist
-            cprint(f"New lowest mean dist: {lowest_mean_dist:.5f} [m]", "green")
-            filepath = checkpoints_dir / f"mlp_lowest_mean_dist.npz"
+                fig_out = plot_network_output_hist(np.asarray(c_batch), np.asarray(x_batch), it)
+                wandb.log({"c_figures/network_output_hist": wandb.Image(fig_out)}, step=it)
+                plt.close(fig_out)
+        if mean_final_dist < lowest_mean_final_dist:
+            lowest_mean_final_dist = mean_final_dist
+            cprint(f"New lowest mean dist: {lowest_mean_final_dist:.5f} [m]", "green")
+            filepath = checkpoints_dir / f"mlp_lowest_mean_final_dist.npz"
             save_mlp_weights(filepath, params)
             if record_video:
                 save_filepath = save_dir / f"best.mp4"
