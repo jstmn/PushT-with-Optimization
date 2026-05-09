@@ -142,7 +142,7 @@ def save_mlp_weights(filepath: Path, params) -> None:
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 N_OPT_STEPS = 10000
-LR = 0.001
+DEFAULT_LR = 0.001
 N_SIM_STEPS = 25
 RESET_SEED = 0
 ACTION_DIM = NUM_FACES + 2
@@ -517,6 +517,7 @@ def main(
     multi_step_n_actions: int | None,
     disable_random: bool,
     use_wandb: bool = True,
+    lr: float | None = None,
 ):
     global _CURRENT_ITERATION
     assert problem_type in ["single_step", "multi_step"], "problem_type must be 'single_step' or 'multi_step'."
@@ -524,6 +525,7 @@ def main(
     is_multi_step = multi_step_n_actions is not None
     n_actions = multi_step_n_actions if is_multi_step else 1
     _configure_solver(multi_step_n_actions)
+    lr = lr if lr is not None else DEFAULT_LR
 
     env = PushTEnv(
         nenvs=n_envs, record_video=record_video, visualize=False, use_relative_coordinates=True, random_mode=random_mode
@@ -549,7 +551,7 @@ def main(
     solver_output_dim = ACTION_DIM * n_actions
     random_pose_str = random_mode
     multi_step_str = "multi-step" if is_multi_step else "single-step"
-    save_dir = Path(f"logs/{now}__n-envs:{n_envs}__lr:{LR}__{random_pose_str}__{multi_step_str}")
+    save_dir = Path(f"logs/{now}__n-envs:{n_envs}__lr:{lr}__{random_pose_str}__{multi_step_str}")
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoints_dir = save_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -567,7 +569,7 @@ def main(
             config=dict(
                 continuous_grad_from_mc=USE_MC_FOR_CONTINUOUS_GRADIENTS,
                 n_envs=n_envs,
-                lr=LR,
+                lr=lr,
                 n_opt_steps=N_OPT_STEPS,
                 n_sim_steps=N_SIM_STEPS,
                 m_rollouts=M_ROLLOUTS,
@@ -581,6 +583,9 @@ def main(
                 n_actions=n_actions,
                 random_mode=random_mode,
                 relative_coordinates=True,
+                checkpoints_dir=checkpoints_dir,
+                iterations_dir=iterations_dir,
+                backward_dir=backward_dir
             ),
         )
 
@@ -588,7 +593,7 @@ def main(
     params = mlp.init(jax.random.PRNGKey(0), jnp.zeros((1, CONTEXT_DIM_RELATIVE)))
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(LR),
+        optax.adam(lr),
     )
     opt_state = optimizer.init(params)
 
@@ -727,7 +732,7 @@ def main(
             print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
 
         print()
-        print(f"|  ------------------------------------------------------------------------------------------  |")
+        print(f"|  --------------------------------------------------------------------------------------------  |")
         print(
             f"|    ------------------------------------     iter {it + 1:2d}     -----------------------------------    |"
         )
@@ -1044,6 +1049,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--problem_type", type=str, default="single_step", choices=["single_step", "multi_step"])
     parser.add_argument("--verbosity", type=int, default=0)
+    parser.add_argument("--lr", type=float)
     parser.add_argument("--n-envs", type=int)
     parser.add_argument(
         "--random-mode",
@@ -1072,4 +1078,5 @@ if __name__ == "__main__":
         multi_step_n_actions=args.multi_step_n_actions,
         disable_random=args.disable_random,
         use_wandb=not args.no_wandb,
+        lr=args.lr,
     )
