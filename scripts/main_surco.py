@@ -59,13 +59,17 @@ System design (SurCo-prior):
 # - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
 unset LD_LIBRARY_PATH  # < note: this runs things with the gpu. Note that it's faster to run on the cpu with nenvs<4
 
-# Random t-pose
-python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --random-t-pose --record-video
 
-python scripts/main_surco.py --n-envs 1 --relative-coordinates --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 4 --relative-coordinates --verbosity 1 --record-video
-python scripts/main_surco.py --n-envs 4 --relative-coordinates --verbosity 1 --random-t-pose
-python scripts/main_surco.py --n-envs 32 --relative-coordinates --verbosity 1 --random-t-pose
+RANDOM_MODE="fixed-spawn__fixed-target" # easy
+RANDOM_MODE="random-spawn__fixed-target" # middle
+RANDOM_MODE="random-spawn__random-target" # hardest
+
+
+# Random mode examples
+python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --record-video
+python scripts/main_surco.py --n-envs 4  --verbosity 1 --random-mode ${RANDOM_MODE}
+python scripts/main_surco.py --n-envs 4  --verbosity 1 --random-mode ${RANDOM_MODE}
+python scripts/main_surco.py --n-envs 32 --verbosity 1 --random-mode ${RANDOM_MODE}
 """
 
 from __future__ import annotations
@@ -161,7 +165,7 @@ PERTURB_LAMBDA = 1.25
 CONTINUOUS_PERTURB_SCALE = 0.1
 
 # Evaluation frequency cfg
-RANDOM_T_POSE_EVAL_EVERY = 25
+RANDOM_T_POSE_EVAL_EVERY = 50
 BASELINE_EVAL_EVERY = 5
 
 #
@@ -407,7 +411,7 @@ def _milp_backward(res, grad_x):
     if verbosity > 0:
         jax.debug.print("  mc_rollout_cost_mean={mc_rollout_cost_mean}", mc_rollout_cost_mean=mc_rollout_cost_mean)
     cprint(
-        f"  [backward]  gurobi ({M_ROLLOUTS} solves): {t_gurobi * 1000:.0f} ms  |  "
+        f"  [backward]  gurobi ({M_ROLLOUTS * n_envs} solves): {t_gurobi * 1000:.0f} ms  |  "
         f"physics rollouts + grad: {t_physics * 1000:.0f} ms",
         "white",
     )
@@ -508,11 +512,10 @@ def main(
     problem_type: str,
     n_envs: int,
     verbosity: int,
-    random_t_pose: bool,
+    random_mode: str,
     record_video: bool,
     multi_step_n_actions: int | None,
     disable_random: bool,
-    relative_coordinates: bool,
     use_wandb: bool = True,
 ):
     global _CURRENT_ITERATION
@@ -523,18 +526,28 @@ def main(
     _configure_solver(multi_step_n_actions)
 
     env = PushTEnv(
-        nenvs=n_envs, record_video=record_video, visualize=False, use_relative_coordinates=relative_coordinates
+        nenvs=n_envs, record_video=record_video, visualize=False, use_relative_coordinates=True, random_mode=random_mode
     )
     _configure_env(env)
     backward_env = PushTEnv(
-        nenvs=n_envs * M_ROLLOUTS, record_video=False, visualize=False, use_relative_coordinates=relative_coordinates
+        nenvs=n_envs * M_ROLLOUTS,
+        record_video=False,
+        visualize=False,
+        use_relative_coordinates=True,
+        random_mode=random_mode,
     )
     _configure_backward_env(backward_env)
-    baseline_env = None if disable_random else PushTEnv(nenvs=n_envs, record_video=False, visualize=False)
+    baseline_env = (
+        None
+        if disable_random
+        else PushTEnv(
+            nenvs=n_envs, record_video=False, visualize=False, use_relative_coordinates=True, random_mode=random_mode
+        )
+    )
     env.reset(seed=RESET_SEED)
     now = datetime.now().strftime("%d__%H:%M:%S")
     solver_output_dim = ACTION_DIM * n_actions
-    random_pose_str = "random-t-pose" if random_t_pose else "fixed-t-pose"
+    random_pose_str = random_mode
     multi_step_str = "multi-step" if is_multi_step else "single-step"
     save_dir = Path(f"logs/{now}__n-envs:{n_envs}__lr:{LR}__{random_pose_str}__{multi_step_str}")
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -566,8 +579,8 @@ def main(
                 num_faces=NUM_FACES,
                 problem_type=problem_type,
                 n_actions=n_actions,
-                random_t_pose=random_t_pose,
-                relative_coordinates=relative_coordinates,
+                random_mode=random_mode,
+                relative_coordinates=True,
             ),
         )
 
@@ -580,15 +593,11 @@ def main(
     opt_state = optimizer.init(params)
 
     def cost_from_c(c, data, rng_solve, solver_verbosity: int, log_forward: bool):
-        if n_envs > 1:
-
+        if n_envs > 1 and "random-target" in random_mode:
             def _check_c(c_np):
                 if np.all(c_np[0] == c_np[1]):
                     print(f"[CHECK FAIL] c is identical across envs: {c_np}")
                     assert False
-                # else:
-                #     print(f"[CHECK OK] c differs")
-
             jax.debug.callback(_check_c, c)
 
         # Do one clean forward solve/rollout. The M_ROLLOUTS Monte Carlo rollouts
@@ -646,12 +655,10 @@ def main(
 
             def _check_ctx_all(ctx_np):
                 dupes = [i for i in range(1, n_envs) if np.allclose(ctx_np[i], ctx_np[0], atol=1e-6)]
-                if dupes:
+                if dupes and "random" in random_mode:
                     cprint(f"[CHECK FAIL] ctx identical to env0 for envs {dupes}", "red")
                     for i in [0] + dupes:
                         cprint(f"  ctx[{i}]={ctx_np[i]}", "red")
-                else:
-                    cprint(f"[CHECK OK] ctx all differ from env0", "green")
 
             jax.debug.callback(_check_ctx_all, ctx)
 
@@ -661,7 +668,7 @@ def main(
 
             def _check_c_all(c_np):
                 dupes = [i for i in range(1, n_envs) if np.allclose(c_np[i], c_np[0], atol=1e-6)]
-                if dupes:
+                if dupes and "random" in random_mode:
                     cprint(f"[CHECK FAIL] c identical to env0 for envs {dupes}", "red")
 
             jax.debug.callback(_check_c_all, c)
@@ -720,14 +727,14 @@ def main(
             print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
 
         print()
-        print(f"|  -------------------------------------------------------------------------------------------  |")
+        print(f"|  ------------------------------------------------------------------------------------------  |")
         print(
-            f"|  ------------------------------------------  iter {it + 1:2d}  ------------------------------------------  |"
+            f"|    ------------------------------------     iter {it + 1:2d}     -----------------------------------    |"
         )
         print()
 
         is_eval_step = (it % RANDOM_T_POSE_EVAL_EVERY) == 0
-        if random_t_pose:
+        if "random" in random_mode:
             if is_eval_step:
                 env.reset(0)
             else:
@@ -742,39 +749,28 @@ def main(
         if n_envs > 1:
             jp = np.asarray(env_data_0.joint_positions)
             jp_dupes = [i for i in range(1, n_envs) if np.all(jp[i] == jp[0])]
-            if jp_dupes:
+            if jp_dupes and "random" in random_mode:
                 cprint(f"[CHECK FAIL] joint_positions identical to env0 for envs: {jp_dupes}", "red")
                 assert False
-            # else:
-            #     cprint(f"[CHECK OK] joint_positions differ across all envs", "green")
-
             t_poses_np = env.t_poses
             tgt_poses_np = env.target_poses
             t_dupes = [i for i in range(1, n_envs) if np.all(t_poses_np[i] == t_poses_np[0])]
             tgt_dupes = [i for i in range(1, n_envs) if np.all(tgt_poses_np[i] == tgt_poses_np[0])]
-            if t_dupes:
+            if t_dupes and "random-spawn" in random_mode:
                 cprint(f"[CHECK FAIL] t_poses identical to env0 for envs: {t_dupes}  values: {t_poses_np}", "red")
-            # else:
-            #     cprint(f"[CHECK OK] t_poses all differ", "green")
-            if tgt_dupes:
+                assert False
+            if tgt_dupes and "random-target" in random_mode:
                 cprint(
                     f"[CHECK FAIL] target_poses identical to env0 for envs: {tgt_dupes}  values: {tgt_poses_np}", "red"
                 )
                 assert False
-            # else:
-            #     cprint(f"[CHECK OK] target_poses all differ", "green")
-            if np.all(tgt_poses_np[0] == tgt_poses_np[1]):
+            if np.all(tgt_poses_np[0] == tgt_poses_np[1]) and "random-target" in random_mode:
                 cprint(f"[CHECK FAIL] target_poses identical: {tgt_poses_np}", "red")
                 assert False
-            # else:
-            #     cprint(f"[CHECK OK] target_poses differ: env0={tgt_poses_np[0]}  env1={tgt_poses_np[1]}", "green")
-
             xy = env._xy_centers
             if np.all(xy[0] == xy[1]):
                 cprint(f"[CHECK FAIL] _xy_centers identical: {xy}", "red")
                 assert False
-            # else:
-            #     cprint(f"[CHECK OK] _xy_centers differ: env0={xy[0]}  env1={xy[1]}", "green")
 
         step_key = jax.random.PRNGKey(it)
         (
@@ -847,13 +843,15 @@ def main(
             initial_final_dists = final_dists_np.copy()
         if initial_faces is None:
             initial_faces = face_idx_np.copy()
-        if not random_t_pose:
+        if not "random" in random_mode:
             if is_eval_step:
                 cprint(f"|____ eval step: using environment from iteration 0", "cyan")
             if n_envs_better_0 is None:
                 n_envs_better_0 = sum(final_dists_np < initial_mean_final_dist - 0.05)
             delta_cm = 100 * (mean_final_dist - initial_mean_final_dist)
-            initial_str = f" | initial mean @ t=0: {initial_mean_final_dist:.5f} [m]" if not random_t_pose else ""
+            initial_str = (
+                f" | initial mean @ t=0: {initial_mean_final_dist:.5f} [m]" if not "random" in random_mode else ""
+            )
             cprint(
                 f"|____ mean_final_dist: {mean_final_dist:.5f} [m] | mean_dist_change: {mean_dist_change * 100:.3f} [cm] | delta from t=0: {delta_cm:.3f} [cm]{initial_str} | {dt * 1000:.1f} ms",
                 "green" if mean_dist_change < 0 else "red",
@@ -906,7 +904,7 @@ def main(
             final_dists_np,
             c_batch,
             x_batch,
-            # grad_c,
+            None, # grad_c
             baseline_means_np,
             pct_vs_baseline,
             grad_x=_LAST_GRAD_X,
@@ -1002,8 +1000,8 @@ def main(
                 n_opt_steps=N_OPT_STEPS,
                 m_rollouts=M_ROLLOUTS,
                 perturb_lambda=PERTURB_LAMBDA,
-                random_t_pose=random_t_pose,
-                relative_coordinates=relative_coordinates,
+                random_mode=random_mode,
+                relative_coordinates=True,
                 random_means=random_means if random_means else None,
                 random_stds=random_stds if random_stds else None,
                 baseline_iters=baseline_iters if baseline_iters else None,
@@ -1047,11 +1045,20 @@ if __name__ == "__main__":
     parser.add_argument("--problem_type", type=str, default="single_step", choices=["single_step", "multi_step"])
     parser.add_argument("--verbosity", type=int, default=0)
     parser.add_argument("--n-envs", type=int)
-    parser.add_argument("--random-t-pose", action="store_true", help="Randomize problem instances each iteration")
+    parser.add_argument(
+        "--random-mode",
+        type=str,
+        default="random-spawn__fixed-target",
+        choices=[
+            "fixed-spawn__fixed-target",
+            "random-spawn__fixed-target",
+            "random-spawn__random-target",
+        ],
+        help="Randomization mode for T block spawn and target poses",
+    )
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--multi-step-n-actions", type=int)
     parser.add_argument("--disable-random", action="store_true", help="Skip random action baseline sampling")
-    parser.add_argument("--relative-coordinates", action="store_true", help="Use relative coordinates")
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
@@ -1060,10 +1067,9 @@ if __name__ == "__main__":
         problem_type=args.problem_type,
         n_envs=args.n_envs,
         verbosity=args.verbosity,
-        random_t_pose=args.random_t_pose,
+        random_mode=args.random_mode,
         record_video=args.record_video,
         multi_step_n_actions=args.multi_step_n_actions,
         disable_random=args.disable_random,
-        relative_coordinates=args.relative_coordinates,
         use_wandb=not args.no_wandb,
     )

@@ -112,6 +112,7 @@ class ActionSolverMultiStep:
             self.xf.append(self.model.addVars(NUM_FACES, vtype=GRB.BINARY, name=f"xf_{m}"))
             self.cp.append(self.model.addVar(lb=_lo_cp, ub=_hi_cp, vtype=GRB.CONTINUOUS, name=f"cp_{m}"))
             self.ang.append(self.model.addVar(lb=_lo_ang, ub=_hi_ang, vtype=GRB.CONTINUOUS, name=f"ang_{m}"))
+            self.model.addConstr(gp.quicksum(self.xf[m][i] for i in range(NUM_FACES)) == 1)
         self.model.update()
 
     def solve(self, c: np.ndarray) -> np.ndarray:

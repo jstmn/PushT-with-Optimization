@@ -20,7 +20,7 @@ def plot_results(
     n_envs,
     n_sim_steps,
     n_opt_steps,
-    random_t_pose,
+    random_mode: str,
     m_rollouts: int,
     perturb_lambda: float,
     relative_coordinates: bool = False,
@@ -38,7 +38,7 @@ def plot_results(
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  "
         f"n_opt_steps={n_opt_steps}  M={m_rollouts}  λ={perturb_lambda}  "
-        f"RANDOM_T_POSE={random_t_pose}  RELATIVE_COORDINATES={relative_coordinates}",
+        f"RANDOM_MODE={random_mode}  RELATIVE_COORDINATES={relative_coordinates}",
         fontweight="bold",
     )
     ax_mean, ax_std = axes[0, 0], axes[0, 1]
