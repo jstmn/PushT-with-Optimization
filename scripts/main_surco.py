@@ -67,8 +67,8 @@ RANDOM_MODE="random-spawn__random-target" # hardest
 
 # Random mode examples
 python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --record-video
-python scripts/main_surco.py --n-envs 4  --verbosity 1 --random-mode ${RANDOM_MODE}
-python scripts/main_surco.py --n-envs 4  --verbosity 1 --random-mode ${RANDOM_MODE}
+python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --no-wandb --optimizer sgd
+python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
 python scripts/main_surco.py --n-envs 32 --verbosity 1 --random-mode ${RANDOM_MODE}
 """
 
@@ -121,6 +121,7 @@ class SurCoMLP(nn.Module):
         x = nn.Dense(self.output_dim)(x)
         x = x.reshape(x.shape[0], -1, NUM_FACES + 2)
         return x.reshape(x.shape[0], -1)
+
 
 def save_mlp_weights(filepath: Path, params) -> None:
     flat = flax.traverse_util.flatten_dict(params, sep="/")
@@ -445,6 +446,9 @@ def save_json(
     baseline_means_per_env=None,  # (nenvs,) or None
     pct_vs_baseline_per_env=None,  # (nenvs,) or None
     grad_x=None,
+    t_poses=None,
+    t_velocities=None,
+    target_poses=None,
 ):
     iteration_payload = {
         "iteration": iteration,
@@ -462,6 +466,9 @@ def save_json(
         if pct_vs_baseline_per_env is None
         else np.asarray(pct_vs_baseline_per_env).tolist(),
         "mean_pct_vs_baseline": None if pct_vs_baseline_per_env is None else float(np.nanmean(pct_vs_baseline_per_env)),
+        "t_poses": None if t_poses is None else np.asarray(t_poses).tolist(),
+        "t_velocities": None if t_velocities is None else np.asarray(t_velocities).tolist(),
+        "target_poses": None if target_poses is None else np.asarray(target_poses).tolist(),
     }
     iteration_json_path.write_text(json.dumps(iteration_payload, indent=2))
 
@@ -507,6 +514,7 @@ def main(
     use_wandb: bool = True,
     lr: float | None = None,
     perturb_lambda: float | None = None,
+    optimizer_type: str = "adam",
 ):
     global _CURRENT_ITERATION, PERTURB_LAMBDA
     if perturb_lambda is not None:
@@ -553,7 +561,17 @@ def main(
     _configure_backward_log_dir(backward_dir)
     os.system(f"xdg-open {save_dir}")
 
+    print("=================")
+    print("Saving to: ")
+    print(f"save_dir:        {save_dir}")
+    print(f"checkpoints_dir: {checkpoints_dir}")
+    print(f"iterations_dir:  {iterations_dir}")
+    print(f"backward_dir:    {backward_dir}")
+    print("=================")
+
     if use_wandb:
+        import wandb
+
         wandb.init(
             project="pusht619-surco",
             name=save_dir.name,
@@ -576,24 +594,34 @@ def main(
                 relative_coordinates=True,
                 checkpoints_dir=checkpoints_dir,
                 iterations_dir=iterations_dir,
-                backward_dir=backward_dir
+                backward_dir=backward_dir,
+                optimizer=optimizer_type,
             ),
         )
 
     mlp = SurCoMLP(hidden_dims=(128, 128), output_dim=solver_output_dim)
     params = mlp.init(jax.random.PRNGKey(0), jnp.zeros((1, CONTEXT_DIM_RELATIVE)))
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adam(lr),
-    )
+
+    if optimizer_type == "sgd":
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.sgd(lr),
+        )
+    else:
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adam(lr),
+        )
     opt_state = optimizer.init(params)
 
     def cost_from_c(c, data, rng_solve, solver_verbosity: int, log_forward: bool):
         if n_envs > 1 and "random-target" in random_mode:
+
             def _check_c(c_np):
                 if np.all(c_np[0] == c_np[1]):
                     print(f"[CHECK FAIL] c is identical across envs: {c_np}")
                     assert False
+
             jax.debug.callback(_check_c, c)
 
         # Do one clean forward solve/rollout. The M_ROLLOUTS Monte Carlo rollouts
@@ -723,9 +751,9 @@ def main(
             print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
 
         print()
-        print(f"|  --------------------------------------------------------------------------------------------  |")
+        print(f"|  ────────────────────────────────────────────────────────────────────────────────────────────  |")
         print(
-            f"|    ------------------------------------     iter {it + 1:2d}     -----------------------------------    |"
+            f"|     ───────────────────────────────────     iter {it + 1:2d}     ──────────────────────────────────     |"
         )
         print()
 
@@ -752,7 +780,7 @@ def main(
             tgt_poses_np = env.target_poses
             t_dupes = [i for i in range(1, n_envs) if np.all(t_poses_np[i] == t_poses_np[0])]
             tgt_dupes = [i for i in range(1, n_envs) if np.all(tgt_poses_np[i] == tgt_poses_np[0])]
-            if t_dupes and "random-spawn" in random_mode:
+            if t_dupes and "random─spawn" in random_mode:
                 cprint(f"[CHECK FAIL] t_poses identical to env0 for envs: {t_dupes}  values: {t_poses_np}", "red")
                 assert False
             if tgt_dupes and "random-target" in random_mode:
@@ -839,7 +867,7 @@ def main(
             initial_final_dists = final_dists_np.copy()
         if initial_faces is None:
             initial_faces = face_idx_np.copy()
-        if not "random" in random_mode:
+        if random_mode == "fixed-spawn__fixed-target" and it > 0:
             if is_eval_step:
                 cprint(f"|____ eval step: using environment from iteration 0", "cyan")
             if n_envs_better_0 is None:
@@ -900,10 +928,13 @@ def main(
             final_dists_np,
             c_batch,
             x_batch,
-            None, # grad_c
+            None,  # grad_c
             baseline_means_np,
             pct_vs_baseline,
             grad_x=_LAST_GRAD_X,
+            t_poses=env.t_poses,
+            t_velocities=env.t_velocities,
+            target_poses=env.target_poses,
         )
 
         # Print gradient statistics
@@ -913,7 +944,7 @@ def main(
             grad_abs_values = [jnp.abs(g) for g in jax.tree_util.tree_leaves(g_params)]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
             mean_grad = float(jnp.mean(jnp.array([jnp.mean(g).item() for g in grad_abs_values])))
-            cprint(f"|____ max |grad|: {max_grad:.6f}, mean |grad|: {mean_grad:.6f}", "yellow")
+            print(f"|____ max |grad|: {max_grad:.6f}, mean |grad|: {mean_grad:.6f}")
 
         if use_wandb:
             wandb_payload: dict = {
@@ -1058,6 +1089,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable-random", action="store_true", help="Skip random action baseline sampling")
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
     parser.add_argument("--perturb-lambda", type=float, help="Randomized smoothing scale (PERTURB_LAMBDA)")
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"], help="Optimizer to use")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     assert args.n_envs is not None, "n_envs must be specified"
@@ -1072,4 +1104,5 @@ if __name__ == "__main__":
         use_wandb=not args.no_wandb,
         lr=args.lr,
         perturb_lambda=args.perturb_lambda,
+        optimizer_type=args.optimizer,
     )
