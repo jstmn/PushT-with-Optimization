@@ -121,18 +121,6 @@ class SurCoMLP(nn.Module):
         x = nn.Dense(self.output_dim)(x)
         x = x.reshape(x.shape[0], -1, NUM_FACES + 2)
         return x.reshape(x.shape[0], -1)
-        # face_logits = x[:, :, :NUM_FACES]
-        # cp_mid = 0.5 * (_CP_LO + _CP_HI)
-        # cp_half = 0.5 * (_CP_HI - _CP_LO)
-        # ang_mid = 0.5 * (_ANG_LO + _ANG_HI)
-        # ang_half = 0.5 * (_ANG_HI - _ANG_LO)
-        # cp_target = cp_mid + cp_half * jnp.tanh(x[:, :, NUM_FACES : NUM_FACES + 1])
-        # ang_target = ang_mid + ang_half * jnp.tanh(x[:, :, NUM_FACES + 1 : NUM_FACES + 2])
-        # cp_target = x[:, :, NUM_FACES : NUM_FACES + 1]
-        # ang_target = x[:, :, NUM_FACES + 1 : NUM_FACES + 2]
-        # out = jnp.concatenate([face_logits, cp_target, ang_target], axis=-1)
-        # return out.reshape(out.shape[0], -1)
-
 
 def save_mlp_weights(filepath: Path, params) -> None:
     flat = flax.traverse_util.flatten_dict(params, sep="/")

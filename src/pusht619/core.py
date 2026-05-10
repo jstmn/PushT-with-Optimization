@@ -26,11 +26,30 @@ import jaxsim.rbda.contacts as _jsc
 import matplotlib.pyplot as plt
 import mujoco as mj
 import rod
-
+import json
+import hashlib
 
 # Action bounds (enforced on concrete :class:`Action` and checked every rollout in ``_step_pure_impl``).
 CONTACT_POINT_BOUNDS = (0.2, 0.8)
 ANGLE_BOUNDS = (jnp.pi * 0.25, jnp.pi * 0.75)
+
+
+ACTION_COST_MATRIX_CACHE_DIR = Path(__file__).parent.parent / "logs" / "optimal_cache"
+ACTION_COST_MATRIX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_action_cost_matrix_cache_filename(t_pose, t_vel, target_pose, n_sim_steps, n_grid):
+    t_pose = np.round(t_pose, 4).tolist()
+    t_vel = np.round(t_vel, 4).tolist()
+    target_pose = np.round(target_pose, 4).tolist()
+    key_dict = {
+        "t_pose": t_pose,
+        "t_vel": t_vel,
+        "target_pose": target_pose,
+        "n_sim_steps": n_sim_steps,
+        "n_grid": n_grid
+    }
+    key_str = json.dumps(key_dict, sort_keys=True)
+    return ACTION_COST_MATRIX_CACHE_DIR / f"{hashlib.md5(key_str.encode()).hexdigest()}.npy"
 
 
 def _raise_unless_contact_angle_bounds(cp: np.ndarray, ang: np.ndarray) -> None:
@@ -872,6 +891,35 @@ class PushTEnv:
         return self._target_poses.copy()
 
     @property
+    def t_velocities(self) -> np.ndarray:
+        """Current velocities (nenvs, 3) — read-only copy."""
+        return self._t_velocities.copy()
+
+    def get_t_and_target_corners(self) -> tuple[np.ndarray, np.ndarray]:
+        """Returns the 8 corner points of the T block and target T block in world coordinates.
+        
+        Returns:
+            t_corners: (nenvs, 8, 2) array of T block corners
+            target_corners: (nenvs, 8, 2) array of target T block corners
+        """
+        def get_corners(poses):
+            x, y, theta = poses[:, 0], poses[:, 1], poses[:, 2]
+            cos_t = np.cos(theta)
+            sin_t = np.sin(theta)
+            # R is (nenvs, 2, 2)
+            R = np.stack([
+                np.stack([cos_t, -sin_t], axis=-1),
+                np.stack([sin_t, cos_t], axis=-1)
+            ], axis=1)
+            # T_CORNERS is (8, 2)
+            # (nenvs, 2, 2) @ (2, 8) -> (nenvs, 2, 8) -> transpose to (nenvs, 8, 2)
+            rotated_corners = np.einsum("nij,kj->nki", R, T_CORNERS)
+            xy = np.stack([x, y], axis=-1)
+            return xy[:, None, :] + rotated_corners
+
+        return get_corners(self._t_poses), get_corners(self._target_poses)
+
+    @property
     def t_target_poses(self) -> np.ndarray:
         """Target pose (3) — read-only copy."""
         return self._target_poses.copy()
@@ -1035,10 +1083,22 @@ class PushTEnv:
                 self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
             elif "fixed-spawn" in self._random_mode:
                 self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
-                rng_fixed = np.random.default_rng(0)
-                self._t_poses[:, 0] = rng_fixed.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
-                self._t_poses[:, 1] = rng_fixed.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
-                self._t_poses[:, 2] = rng_fixed.uniform(-np.pi, np.pi, size=self._nenvs)
+                if self._nenvs == 1:
+                    self._t_poses[:, 0] = WORKSPACE_WIDTH/4
+                    self._t_poses[:, 1] = WORKSPACE_HEIGHT/4
+                    self._t_poses[:, 2] = 0.0
+                elif self._nenvs == 2:
+                    self._t_poses[0, 0] = WORKSPACE_WIDTH/4
+                    self._t_poses[0, 1] = WORKSPACE_HEIGHT/4
+                    self._t_poses[0, 2] = 0.0
+                    self._t_poses[1, 0] = 3*WORKSPACE_WIDTH/4
+                    self._t_poses[1, 1] = 3*WORKSPACE_HEIGHT/4
+                    self._t_poses[1, 2] = 0.0
+                else:
+                    rng_fixed = np.random.default_rng(0)
+                    self._t_poses[:, 0] = rng_fixed.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+                    self._t_poses[:, 1] = rng_fixed.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+                    self._t_poses[:, 2] = rng_fixed.uniform(-np.pi, np.pi, size=self._nenvs)
             else:
                 raise ValueError(f"Unknown random_mode for spawn: {self._random_mode}")
         else:
@@ -1077,6 +1137,7 @@ class PushTEnv:
             base_angular_velocity=jnp.zeros_like(self._data._base_angular_velocity),
             joint_velocities=jnp.zeros_like(self._data.joint_velocities),
         )
+        self._t_velocities = np.zeros((self._nenvs, 3), dtype=np.float32)
         # Cache the pinned base state so every sim step can re-clamp it.
         # `env_center` is structurally a floating base in the SDF, so any joint
         # force applied on descendant joints (pusher, T) creates a reaction that
@@ -1280,6 +1341,12 @@ class PushTEnv:
             check_t_displacement=check_t_displacement,
         )
         self._t_poses = np.asarray(t_poses[:, -1, :])
+
+        # Update t_velocities from the final state of the rollout
+        vx = self._data.joint_velocities[:, self._T_x_idx]
+        vy = self._data.joint_velocities[:, self._T_y_idx]
+        vtheta = self._data.joint_velocities[:, self._T_theta_idx]
+        self._t_velocities = np.stack([vx, vy, vtheta], axis=-1)
 
         # ── Post-hoc replay into viz / recorder ─────────────────────────
         if self._visualizer is not None or self._record_video:
