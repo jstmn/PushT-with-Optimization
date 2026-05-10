@@ -56,7 +56,6 @@ System design (SurCo-prior):
 
 
 # --- Example usage
-# - Note: poor performance observed with n-envs < 16. This is likely due to the gradients being too noisy.
 unset LD_LIBRARY_PATH  # < note: this runs things with the gpu. Note that it's faster to run on the cpu with nenvs<4
 
 
@@ -68,7 +67,7 @@ RANDOM_MODE="random-spawn__random-target" # hardest
 # Random mode examples
 python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --record-video
 python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --no-wandb --optimizer sgd
-python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
+python scripts/main_surco.py --n-envs 2  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
 python scripts/main_surco.py --n-envs 32 --verbosity 1 --random-mode ${RANDOM_MODE}
 """
 
@@ -117,7 +116,8 @@ class SurCoMLP(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         for dim in self.hidden_dims:
             x = nn.Dense(dim)(x)
-            x = nn.relu(x)
+            # x = nn.relu(x)
+            x = nn.leaky_relu(x)
         x = nn.Dense(self.output_dim)(x)
         x = x.reshape(x.shape[0], -1, NUM_FACES + 2)
         return x.reshape(x.shape[0], -1)
@@ -150,7 +150,8 @@ USE_MC_FOR_CONTINUOUS_GRADIENTS = False
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
 # Too large → x_k far from x*; gradient bias grows.
-PERTURB_LAMBDA = 1.25
+PERTURB_LAMBDA = 0.5
+# PERTURB_LAMBDA = 1.25
 CONTINUOUS_PERTURB_SCALE = 0.1
 
 # Evaluation frequency cfg
@@ -294,7 +295,7 @@ def _milp_backward(res, grad_x):
     c_pert_ks: list = []
 
     if verbosity > 0:
-        jax.debug.print("  c={c}", c=c)
+        jax.debug.print("c=\n{c}", c=c)
 
     # Gurobi pure_callbacks are inherently sequential — loop only for solves.
     t_gurobi_start = time()
@@ -306,10 +307,11 @@ def _milp_backward(res, grad_x):
             eps_face = eps_face.at[:, lo : lo + NUM_FACES].set(
                 jax.random.normal(subkey, (n_envs, NUM_FACES), dtype=jnp.float32)
             )
-            key, subkey = jax.random.split(key)
-            eps_face = eps_face.at[:, lo + NUM_FACES : lo + NUM_FACES + 2].set(
-                CONTINUOUS_PERTURB_SCALE * jax.random.normal(subkey, (n_envs, 2), dtype=jnp.float32)
-            )
+            if USE_MC_FOR_CONTINUOUS_GRADIENTS:
+                key, subkey = jax.random.split(key)
+                eps_face = eps_face.at[:, lo + NUM_FACES : lo + NUM_FACES + 2].set(
+                    CONTINUOUS_PERTURB_SCALE * jax.random.normal(subkey, (n_envs, 2), dtype=jnp.float32)
+                )
         c_pert = (c + PERTURB_LAMBDA * eps_face).astype(jnp.float32)
         x_k = _solve_milp_pure_callback(c_pert)
         x_k_blocks = x_k.reshape(n_envs, n_actions, ACTION_DIM)
@@ -397,13 +399,13 @@ def _milp_backward(res, grad_x):
             grad_c_continuous = grad_c_continuous.at[:, lo + NUM_FACES + 1].set(grad_ang_0[:, action_idx])
         grad_c = grad_c_face + grad_c_continuous
 
-    if verbosity > 0:
+    if verbosity > 1:
         jax.debug.print("  mc_rollout_cost_mean={mc_rollout_cost_mean}", mc_rollout_cost_mean=mc_rollout_cost_mean)
-    cprint(
-        f"  [backward]  gurobi ({M_ROLLOUTS * n_envs} solves): {t_gurobi * 1000:.0f} ms  |  "
-        f"physics rollouts + grad: {t_physics * 1000:.0f} ms",
-        "white",
-    )
+    # cprint(
+    #     f"  [backward]  gurobi ({M_ROLLOUTS * n_envs} solves): {t_gurobi * 1000:.0f} ms  |  "
+    #     f"physics rollouts + grad: {t_physics * 1000:.0f} ms",
+    #     "white",
+    # )
 
     global _LAST_GRAD_X
     _LAST_GRAD_X = np.asarray(grad_x)
@@ -650,7 +652,7 @@ def main(
 
         if log_forward and verbosity > 0:
             jax.debug.print(
-                "  sum(is_nan)={n} task_loss={task_loss:.6f} face_logit_regularization={flr:.6f} cp_regularization={cpr:.6f} angle_regularization={ar:.6f}",
+                "sum(is_nan)={n} task_loss={task_loss:.6f} face_logit_regularization={flr:.6f} cp_regularization={cpr:.6f} angle_regularization={ar:.6f}",
                 n=jnp.sum(jnp.isnan(t_distances[:, -1])),
                 task_loss=task_loss,
                 flr=face_logit_regularization,
@@ -658,7 +660,7 @@ def main(
                 ar=angle_regularization,
             )
         if log_forward and verbosity > 1:
-            jax.debug.print("  final_dists={d}", d=t_distances[:, -1])
+            jax.debug.print("final_dists=\n{d}", d=t_distances[:, -1])
         return loss, (
             t_distances,
             jpos_traj,
@@ -697,15 +699,8 @@ def main(
 
             jax.debug.callback(_check_c_all, c)
 
-        if verbosity > 1:
-            jax.debug.print(
-                "context  any_nan={n} min={lo:.3f} max={hi:.3f}",
-                n=jnp.any(jnp.isnan(ctx)),
-                lo=ctx.min(),
-                hi=ctx.max(),
-            )
         if verbosity > 0:
-            jax.debug.print("context={ctx}", ctx=ctx)
+            jax.debug.print("context=\n{ctx}", ctx=ctx)
         return cost_from_c(c, data, rng_solve, verbosity, True)
 
     # Do NOT wrap in jax.jit: pure_callback dispatches to Python per Gurobi
@@ -877,7 +872,7 @@ def main(
                 f" | initial mean @ t=0: {initial_mean_final_dist:.5f} [m]" if not "random" in random_mode else ""
             )
             cprint(
-                f"|____ mean_final_dist: {mean_final_dist:.5f} [m] | mean_dist_change: {mean_dist_change * 100:.3f} [cm] | delta from t=0: {delta_cm:.3f} [cm]{initial_str} | {dt * 1000:.1f} ms",
+                f"|____ mean_final_dist: {mean_final_dist:.5f} [m] | mean_dist_change: {mean_dist_change * 100:.3f} [cm] | delta from t=0: {delta_cm:.3f} [cm]{initial_str}",
                 "green" if mean_dist_change < 0 else "red",
             )
             n_envs_better = sum(final_dists_np < initial_mean_final_dist - 0.05)
@@ -885,14 +880,11 @@ def main(
                 f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}",
                 "green" if n_envs_better > n_envs_better_0 else "red",
             )
-        print(f"|____ face initial= {initial_faces[:, 0]}")
-        print(f"|____ face current= {face_idx_np[:, 0]}")
+        print(f"faces=          {face_idx_np[:, 0]}")
+        print(f"angles=         {ang_hist_current[:, 0]}")
+        print(f"contact-points= {cp_hist_current[:, 0]}")
+        print(f"\n|____ face initial= {initial_faces[:, 0]}")
         print(f"|____ face diff=    {(face_idx_np - initial_faces)[:, 0]}")
-        print(f"|____ angles=       {ang_hist_current[:, 0]}")
-        print(f"|____ contact-point={cp_hist_current[:, 0]}")
-        if verbosity > 1:
-            cprint(f"|____ c=           {np.asarray(c_batch).tolist()}", "yellow")
-            # cprint(f"|____ dloss/dc=    {grad_c.tolist()}", "yellow")
         baseline_means_np = None
         pct_vs_baseline = None
         mean_pct_vs_baseline = None
@@ -1041,7 +1033,7 @@ def main(
                 fig_out = plot_network_output_hist(np.asarray(c_batch), np.asarray(x_batch), it)
                 wandb.log({"c_figures/network_output_hist": wandb.Image(fig_out)}, step=it)
                 plt.close(fig_out)
-        if mean_final_dist < lowest_mean_final_dist:
+        if mean_final_dist < lowest_mean_final_dist and it > 0:
             lowest_mean_final_dist = mean_final_dist
             cprint(f"New lowest mean dist: {lowest_mean_final_dist:.5f} [m]", "green")
             filepath = checkpoints_dir / f"mlp_lowest_mean_final_dist.npz"
