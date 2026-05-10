@@ -518,8 +518,11 @@ def main(
     disable_random: bool,
     use_wandb: bool = True,
     lr: float | None = None,
+    perturb_lambda: float | None = None,
 ):
-    global _CURRENT_ITERATION
+    global _CURRENT_ITERATION, PERTURB_LAMBDA
+    if perturb_lambda is not None:
+        PERTURB_LAMBDA = perturb_lambda
     assert problem_type in ["single_step", "multi_step"], "problem_type must be 'single_step' or 'multi_step'."
     assert verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     is_multi_step = multi_step_n_actions is not None
@@ -1066,6 +1069,7 @@ if __name__ == "__main__":
     parser.add_argument("--multi-step-n-actions", type=int)
     parser.add_argument("--disable-random", action="store_true", help="Skip random action baseline sampling")
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
+    parser.add_argument("--perturb-lambda", type=float, help="Randomized smoothing scale (PERTURB_LAMBDA)")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     assert args.n_envs is not None, "n_envs must be specified"
@@ -1079,4 +1083,5 @@ if __name__ == "__main__":
         disable_random=args.disable_random,
         use_wandb=not args.no_wandb,
         lr=args.lr,
+        perturb_lambda=args.perturb_lambda,
     )
