@@ -73,6 +73,8 @@ python scripts/main_surco.py --n-envs 4  --verbosity 1 --random-mode ${RANDOM_MO
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
 import json
 import os
 from time import time
@@ -239,6 +241,23 @@ def _run_rollout(
     jpos_traj = jnp.concatenate(jpos_traj_parts, axis=1)
     return jnp.nanmean(t_distances[:, -1]), t_distances, jpos_traj
 
+def calculate_action_cost(x_star: jnp.ndarray, data, env: PushTEnv) -> jnp.ndarray:
+    """Calculate the cost of the action x_star.
+    """
+    n_envs = x_star.shape[0]
+    n_actions = x_star.shape[1] // ACTION_DIM
+    x_star_blocks = x_star.reshape(n_envs, n_actions, ACTION_DIM)
+    face_weights = x_star_blocks[:, :, :NUM_FACES]
+    contact_point = x_star_blocks[:, :, NUM_FACES]
+    angle = x_star_blocks[:, :, NUM_FACES + 1]
+    _, t_dists, _ = _run_rollout(
+        face_weights=face_weights,
+        cp=contact_point,
+        ang=angle,
+        data=data,
+        env=env
+    )
+    return t_dists[:, -1]
 
 def _n_actions(action_dim: int) -> int:
     if action_dim % ACTION_DIM != 0:
@@ -367,15 +386,18 @@ def _milp_backward(res, grad_x):
     # grad_cp_0 = (1/M) Σ_k ∂L_k/∂cp  (chain rule through jnp.repeat averages over M)
 
     # Face MC gradient — mean-baseline control variate reduces variance.
-    mc_rollout_cost_mean = mc_rollout_costs_per_perturbation.mean()
-    mean_cost_per_env = jnp.nanmean(costs_per_env_all, axis=0)
+    # mc_rollout_cost_mean = mc_rollout_costs_per_perturbation.mean()
     grad_c_face = jnp.zeros_like(c)
     grad_c_mc_cont = jnp.zeros_like(c)
+
+    # Get the cost of c (not perturbed) for MC gradient estimation
+    current_c_dists = calculate_action_cost(x_star, data, _ENV)
+    assert current_c_dists.shape == (n_envs,), f"current_c_dists.shape: {current_c_dists.shape}"
 
     for k_i in range(M_ROLLOUTS):
         # We divide diff by n_envs because task_loss is a mean over all envs,
         # so the gradient of the task_loss is 1/N * gradient of the env cost.
-        cost_diff = (costs_per_env_all[k_i] - mean_cost_per_env) / n_envs
+        cost_diff = (costs_per_env_all[k_i] - current_c_dists) / n_envs
         eps_f = eps_faces[k_i]
 
         for action_idx in range(n_actions):
@@ -431,6 +453,9 @@ def _milp_backward(res, grad_x):
     #     "white",
     # )
 
+    # M: number of MC rollouts
+    # N: number of environments
+    # D: action dimension
     global _LAST_GRAD_X
     _LAST_GRAD_X = np.asarray(grad_x)
     if _BACKWARD_LOG_DIR is not None and _CURRENT_ITERATION >= 0:
@@ -446,6 +471,7 @@ def _milp_backward(res, grad_x):
             mc_rollout_costs_per_perturbation=np.asarray(mc_rollout_costs_per_perturbation),  # (M,)
             grad_c=np.asarray(grad_c),
             grad_c_face=np.asarray(grad_c_face),
+            current_c_dists=np.asarray(current_c_dists),
             # grad_c_continuous=np.asarray(grad_c_continuous),
         )
 
@@ -460,8 +486,7 @@ def _milp_backward(res, grad_x):
 milp_solver.defvjp(_milp_forward, _milp_backward)
 
 
-from dataclasses import dataclass
-from typing import Optional
+
 
 
 @dataclass
@@ -610,34 +635,40 @@ def main(
 
     if use_wandb:
         import wandb
-
+        cfg = dict(
+            continuous_grad_from_mc=USE_MC_FOR_CONTINUOUS_GRADIENTS,
+            n_envs=n_envs,
+            lr=lr,
+            n_opt_steps=N_OPT_STEPS,
+            n_sim_steps=N_SIM_STEPS,
+            m_rollouts=M_ROLLOUTS,
+            perturb_lambda=PERTURB_LAMBDA,
+            face_output_reg_beta=FACE_OUTPUT_REG_BETA,
+            contact_point_reg_beta=CONTACT_POINT_REG_BETA,
+            angle_reg_beta=ANGLE_REG_BETA,
+            baseline_eval_every=BASELINE_EVAL_EVERY,
+            num_faces=NUM_FACES,
+            problem_type=problem_type,
+            n_actions=n_actions,
+            random_mode=random_mode,
+            relative_coordinates=True,
+            checkpoints_dir=checkpoints_dir,
+            iterations_dir=iterations_dir,
+            backward_dir=backward_dir,
+            optimizer=optimizer_type,
+            mlp_hidden_dims=MLP_HIDDEN_DIMS,
+            using_c_cost_for_mc_grad=True,
+        )
         wandb.init(
             project="pusht619-surco",
             name=save_dir.name,
-            config=dict(
-                continuous_grad_from_mc=USE_MC_FOR_CONTINUOUS_GRADIENTS,
-                n_envs=n_envs,
-                lr=lr,
-                n_opt_steps=N_OPT_STEPS,
-                n_sim_steps=N_SIM_STEPS,
-                m_rollouts=M_ROLLOUTS,
-                perturb_lambda=PERTURB_LAMBDA,
-                face_output_reg_beta=FACE_OUTPUT_REG_BETA,
-                contact_point_reg_beta=CONTACT_POINT_REG_BETA,
-                angle_reg_beta=ANGLE_REG_BETA,
-                baseline_eval_every=BASELINE_EVAL_EVERY,
-                num_faces=NUM_FACES,
-                problem_type=problem_type,
-                n_actions=n_actions,
-                random_mode=random_mode,
-                relative_coordinates=True,
-                checkpoints_dir=checkpoints_dir,
-                iterations_dir=iterations_dir,
-                backward_dir=backward_dir,
-                optimizer=optimizer_type,
-                mlp_hidden_dims=MLP_HIDDEN_DIMS,
-            ),
+            config=cfg,
         )
+        print("==========")
+        print("wandb config:")
+        for k, v in cfg.items():
+            print(f"  {k}:\t{v}")
+        print("==========")
 
     mlp = SurCoMLP(hidden_dims=MLP_HIDDEN_DIMS, output_dim=solver_output_dim)
     params = mlp.init(jax.random.PRNGKey(0), jnp.zeros((1, CONTEXT_DIM_RELATIVE)))
@@ -673,7 +704,6 @@ def main(
         contact_points = x_star_blocks[:, :, NUM_FACES]
         angles = x_star_blocks[:, :, NUM_FACES + 1]
         face_idx = jnp.argmax(face_weights, axis=-1)
-
         face_weights_in = jax.nn.one_hot(face_idx, NUM_FACES)
         task_loss, t_distances, jpos_traj = _run_rollout(face_weights_in, contact_points, angles, data)
 

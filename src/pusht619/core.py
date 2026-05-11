@@ -197,7 +197,7 @@ def _plan_push_jax(
     also w.r.t. `face`. A `(nenvs,)` int `face` behaves like a hard gather and
     carries zero gradient.
     """
-    assert t_poses.shape == (nenvs, 3), f"t_poses must be (nenvs, 3), got {t_poses.shape}"
+    assert t_poses.shape == (nenvs, 3), f"t_poses must be (nenvs={nenvs}, 3), got {t_poses.shape}"
     assert face.shape in ((nenvs,), (nenvs, NUM_FACES)), (
         f"face must be (nenvs,) or (nenvs, NUM_FACES), got {face.shape}"
     )
