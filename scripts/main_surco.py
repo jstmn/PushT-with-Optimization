@@ -159,8 +159,8 @@ USE_MC_FOR_CONTINUOUS_GRADIENTS = False
 # Randomized smoothing scale: perturbed costs are c + λ ε, ε ~ N(0, I).
 # Too small → perturbed solves often match x*; estimator variance high.
 # Too large → x_k far from x*; gradient bias grows.
-PERTURB_LAMBDA = 0.5
-# PERTURB_LAMBDA = 1.25
+# PERTURB_LAMBDA = 0.5
+PERTURB_LAMBDA = 1.25
 CONTINUOUS_PERTURB_SCALE = 0.1
 
 # Evaluation frequency cfg
@@ -592,6 +592,8 @@ def main(
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     iterations_dir = save_dir / "iterations"
     iterations_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir = save_dir / "images"
+    figures_dir.mkdir(parents=True, exist_ok=True)
     backward_dir = save_dir / "backward"
     backward_dir.mkdir(parents=True, exist_ok=True)
     _configure_backward_log_dir(backward_dir)
@@ -1013,16 +1015,16 @@ def main(
                 m_rollouts=M_ROLLOUTS,
                 perturb_lambda=PERTURB_LAMBDA,
                 relative_coordinates=True,
-                save_filepath=save_dir / f"{it + 1:03d}.png",
-                save_filepath2=save_dir / f"latest.png",
+                save_filepath=figures_dir / f"{it + 1:03d}.png",
+                save_filepath2=figures_dir / f"latest.png",
                 open_after_save=False,
             )
             t_poses_initial = np.asarray(jpos_traj[:, 0, [env._T_x_idx, env._T_y_idx, env._T_theta_idx]])
             t_poses_final = np.asarray(jpos_traj[:, -1, [env._T_x_idx, env._T_y_idx, env._T_theta_idx]])
             pusher_initial_positions = np.asarray(jpos_traj[:, 0, [env._pusher_x_idx, env._pusher_y_idx]])
-            rollout_save_filepath = save_dir / f"rollout_{it + 1:03d}.png"
+            rollout_save_filepath = figures_dir / f"rollout_{it + 1:03d}.png"
             plot_rollout(
-                save_dir=save_dir,
+                save_dir=figures_dir,
                 t_poses_initial=t_poses_initial,
                 t_poses_final=t_poses_final,
                 target_poses=env.target_poses,
@@ -1031,7 +1033,7 @@ def main(
             )
             if use_wandb:
                 fig_out = plot_network_output_hist(np.asarray(c_batch), np.asarray(x_batch), it)
-                wandb.log({"plot": wandb.Image(str(save_dir / "latest.png"))}, step=it)
+                wandb.log({"plot": wandb.Image(str(figures_dir / "latest.png"))}, step=it)
                 wandb.log({"c_figures/network_output_hist": wandb.Image(fig_out)}, step=it)
                 wandb.log({"rollout": wandb.Image(str(rollout_save_filepath))}, step=it)
                 plt.close(fig_out)
@@ -1041,7 +1043,7 @@ def main(
             filepath = checkpoints_dir / f"mlp_lowest_mean_dist_delta.npz"
             save_mlp_weights(filepath, params)
             if record_video:
-                save_filepath = save_dir / f"best.mp4"
+                save_filepath = figures_dir / f"best.mp4"
                 env.save_video_from_jpos_traj(save_filepath, np.asarray(jpos_traj))
 
         # Save video

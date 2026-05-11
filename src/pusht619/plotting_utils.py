@@ -285,7 +285,7 @@ def plot_rollout(
     save_filepath=None,
 ):
     """Plots the before and after for every T, pusher's initial position, and an arrow showing T movement."""
-    from pusht619.core import get_t_and_target_corners
+    from pusht619.core import get_t_and_target_corners, NUM_FACES, T_CORNERS, FACE_START_POINTS, FACE_END_POINTS
     import numpy as np
 
     n_envs = t_poses_initial.shape[0]
@@ -373,6 +373,30 @@ def plot_rollout(
             )
             ax.add_patch(t_poly_initial)
             all_pts.append(t_corners_initial[0])
+
+            # Label the environment
+            t_center = np.mean(t_corners_initial[0], axis=0)
+            ax.text(t_center[0], t_center[1], f"Env {i}", ha="center", va="center", fontsize=8, fontweight="bold")
+
+            # Label the faces
+            for face_idx in range(NUM_FACES):
+                start_idx = np.where(np.all(T_CORNERS == FACE_START_POINTS[face_idx], axis=1))[0][0]
+                end_idx = np.where(np.all(T_CORNERS == FACE_END_POINTS[face_idx], axis=1))[0][0]
+                p_start = t_corners_initial[0, start_idx]
+                p_end = t_corners_initial[0, end_idx]
+                midpoint = (p_start + p_end) / 2
+                normal = np.array([-(p_end[1] - p_start[1]), p_end[0] - p_start[0]])
+                normal = normal / np.linalg.norm(normal)
+                text_pos = midpoint + normal * 0.02
+                ax.text(
+                    text_pos[0],
+                    text_pos[1],
+                    str(face_idx),
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    bbox=dict(facecolor="white", alpha=0.5, edgecolor="none", pad=0.5),
+                )
 
             # Final T
             t_corners_final, _ = get_t_and_target_corners(np.array([t_poses_final[i]]), np.array([target_poses[i]]))

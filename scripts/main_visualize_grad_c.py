@@ -9,112 +9,63 @@ from pusht619.core import NUM_FACES
 
 """Visualize the gradient of the cost with respect to the action.
 
-python scripts/main_visualize_grad_c.py --backward-dir logs/10__16:33:09__n-envs:2__lr:0.05__fixed-spawn__fixed-target__single-step/backward
+python scripts/main_visualize_grad_c.py --backward-dir logs/10__20:43:43__n-envs:4__lr:0.05__fixed-spawn__fixed-target__single-step/backward
 """
 
 ACTION_DIM = 6
 
 
-def plot_line(iterations, env_action_grads, save_path):
-    fig, ax = plt.subplots(figsize=(10, 5))
+def plot_c_and_grads(iterations, env_c, env_grad_c_face, env_chosen_face, save_path):
+    fig, axes = plt.subplots(NUM_FACES + 1, 1, figsize=(12, 10), sharex=True)
+
+    min_c = np.min(env_c)
+    max_c = np.max(env_c)
+    c_range = max_c - min_c if max_c > min_c else 1.0
+    y_min = min_c - 0.25 * c_range
+    y_max = max_c + 0.25 * c_range
+
     for face_idx in range(NUM_FACES):
-        raw_grads = env_action_grads[:, face_idx]
-        ax.plot(iterations, raw_grads, label=f"Face {face_idx}", alpha=0.4)
-        if len(iterations) >= 5:
-            smoothed = np.convolve(raw_grads, np.ones(5) / 5, mode="valid")
-            ax.plot(iterations[2:-2], smoothed, linewidth=2, color=ax.lines[-1].get_color())
-    ax.set_title("Line Plot (Raw & Smoothed)")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Gradient Value")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close(fig)
+        ax = axes[face_idx]
+        c_vals = env_c[:, face_idx]
+        grads = env_grad_c_face[:, face_idx]
 
+        ax.plot(iterations, c_vals, label=f"Face {face_idx} Logit (c)", color="blue", linewidth=2)
 
-def plot_heatmap(iterations, env_action_grads, save_path):
-    fig, ax = plt.subplots(figsize=(10, 5))
-    im = ax.imshow(
-        env_action_grads.T,
-        aspect="auto",
-        cmap="coolwarm",
-        extent=[iterations[0], iterations[-1], NUM_FACES - 0.5, -0.5],
-    )
-    ax.set_title("Heatmap")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Face Index")
+        # Add arrows for gradients
+        # Normalize gradients for arrow length
+        max_grad = np.max(np.abs(grads)) if np.max(np.abs(grads)) > 0 else 1.0
+
+        for i, (x, y, g) in enumerate(zip(iterations, c_vals, grads)):
+            if abs(g) > 1e-4:
+                direction = 1 if g > 0 else -1
+                color = "red" if g > 0 else "green"
+
+                # Scale arrow length slightly based on magnitude, but keep it visible
+                arrow_length = 0.5 * (abs(g) / max_grad) * c_range
+                if arrow_length < 0.05 * c_range:
+                    arrow_length = 0.05 * c_range
+
+                ax.annotate(
+                    "",
+                    xy=(x, y + direction * arrow_length),
+                    xytext=(x, y),
+                    arrowprops=dict(arrowstyle="->", color=color, lw=1.5, alpha=0.7),
+                )
+
+        ax.set_ylabel(f"Face {face_idx}\nLogit")
+        ax.set_ylim(y_min, y_max)
+        ax.grid(True, alpha=0.3)
+
+    # Fifth subplot: chosen face
+    ax = axes[NUM_FACES]
+    ax.scatter(iterations, env_chosen_face, color="purple", marker="o")
+    ax.plot(iterations, env_chosen_face, color="purple", alpha=0.3)
     ax.set_yticks(range(NUM_FACES))
-    fig.colorbar(im, ax=ax, label="Gradient Value")
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close(fig)
-
-
-def plot_cumulative(iterations, env_action_grads, save_path):
-    fig, ax = plt.subplots(figsize=(10, 5))
-    cumulative_grads = np.cumsum(env_action_grads, axis=0)
-    for face_idx in range(NUM_FACES):
-        ax.plot(iterations, cumulative_grads[:, face_idx], label=f"Face {face_idx}", linewidth=2)
-    ax.set_title("Cumulative Gradient")
+    ax.set_ylabel("Chosen Face")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Cumulative Gradient Value")
-    ax.legend()
     ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close(fig)
 
-
-def plot_stacked(iterations, env_action_grads, save_path):
-    fig, ax = plt.subplots(figsize=(12, 5))
-    bottom_pos = np.zeros(len(iterations))
-    bottom_neg = np.zeros(len(iterations))
-
-    for face_idx in range(NUM_FACES):
-        grads = env_action_grads[:, face_idx]
-        pos_grads = np.maximum(grads, 0)
-        neg_grads = np.minimum(grads, 0)
-
-        p = ax.bar(iterations, pos_grads, bottom=bottom_pos, label=f"Face {face_idx}")
-        ax.bar(iterations, neg_grads, bottom=bottom_neg, color=p[0].get_facecolor())
-
-        bottom_pos += pos_grads
-        bottom_neg += neg_grads
-
-    ax.set_title("Stacked Bar Chart")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Gradient Value")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close(fig)
-
-
-def plot_violin(iterations, env_action_grads, save_path):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    data = [env_action_grads[:, i] for i in range(NUM_FACES)]
-    ax.violinplot(data, positions=range(NUM_FACES), showmeans=True)
-    ax.set_title("Gradient Distribution per Face")
-    ax.set_xlabel("Face Index")
-    ax.set_ylabel("Gradient Value")
-    ax.set_xticks(range(NUM_FACES))
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close(fig)
-
-
-def plot_scatter(iterations, env_action_grads, env_costs, save_path):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    grad_magnitudes = np.linalg.norm(env_action_grads, axis=1)
-    sc = ax.scatter(env_costs, grad_magnitudes, c=iterations, cmap="viridis", alpha=0.7)
-    ax.set_title("Gradient Magnitude vs. Mean Cost")
-    ax.set_xlabel("Mean Cost")
-    ax.set_ylabel("Gradient Magnitude (L2 Norm)")
-    fig.colorbar(sc, ax=ax, label="Iteration")
-    ax.grid(True, alpha=0.3)
+    fig.suptitle("Face Logits (c) and Gradients over Iterations")
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close(fig)
@@ -151,14 +102,17 @@ def main():
     iterations = [x[0] for x in npz_files]
 
     all_grad_c_face = []
-    all_costs = []
+    all_c = []
+    all_x_star = []
     for _, f in npz_files:
         data = np.load(f)
         all_grad_c_face.append(data["grad_c_face"])
-        all_costs.append(np.mean(data["costs_per_env"], axis=0))
+        all_c.append(data["c"])
+        all_x_star.append(data["x_star"])
 
     all_grad_c_face = np.stack(all_grad_c_face, axis=0)
-    all_costs = np.stack(all_costs, axis=0)
+    all_c = np.stack(all_c, axis=0)
+    all_x_star = np.stack(all_x_star, axis=0)
 
     n_iterations, n_envs, action_dim = all_grad_c_face.shape
     n_actions = action_dim // ACTION_DIM
@@ -169,19 +123,18 @@ def main():
         for action_idx in range(n_actions):
             start_idx = action_idx * ACTION_DIM
             end_idx = start_idx + NUM_FACES
-            env_action_grads = all_grad_c_face[:, env_idx, start_idx:end_idx]
-            env_costs = all_costs[:, env_idx]
+
+            env_grad_c_face = all_grad_c_face[:, env_idx, start_idx:end_idx]
+            env_c = all_c[:, env_idx, start_idx:end_idx]
+            env_x_star_face = all_x_star[:, env_idx, start_idx:end_idx]
+            env_chosen_face = np.argmax(env_x_star_face, axis=1)
 
             base_path = backward_dir.parent / f"grad_c_face_env_{env_idx}_action_{action_idx}"
+            print(f"Saving plot to {base_path}_stacked_c.png")
 
-            plot_line(iterations, env_action_grads, f"{base_path}_line.png")
-            plot_heatmap(iterations, env_action_grads, f"{base_path}_heatmap.png")
-            plot_cumulative(iterations, env_action_grads, f"{base_path}_cumulative.png")
-            plot_stacked(iterations, env_action_grads, f"{base_path}_stacked.png")
-            plot_violin(iterations, env_action_grads, f"{base_path}_violin.png")
-            plot_scatter(iterations, env_action_grads, env_costs, f"{base_path}_scatter.png")
+            plot_c_and_grads(iterations, env_c, env_grad_c_face, env_chosen_face, f"{base_path}_stacked_c.png")
 
-        print(f"Saved all 6 plots for environment {env_idx}")
+        print(f"Saved plots for environment {env_idx}")
 
 
 if __name__ == "__main__":
