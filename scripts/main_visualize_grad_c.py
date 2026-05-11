@@ -103,9 +103,11 @@ def plot_c_and_grads(iterations, c, grad_c, env_chosen_face, save_path):
 
     min_c = np.min(c)
     max_c = np.max(c)
-    c_range = max_c - min_c if max_c > min_c else 1.0
-    y_min = min_c - 0.25 * c_range
-    y_max = max_c + 0.25 * c_range
+    c_range = max_c - min_c
+    y_min = min_c
+    y_max = max_c
+    # y_min = min_c - 0.25 * c_range
+    # y_max = max_c + 0.25 * c_range
     max_grad = np.max(np.abs(grad_c))
 
     for face_idx in range(NUM_FACES):
