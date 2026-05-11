@@ -94,7 +94,7 @@ import flax.linen as nn
 import flax.traverse_util
 from pusht619.models import ActionSolver, ActionSolverMultiStep
 from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES, CONTEXT_DIM_RELATIVE
-from pusht619.plotting_utils import plot_results, plot_perturbation_hist, plot_network_output_hist
+from pusht619.plotting_utils import plot_results, plot_perturbation_hist, plot_network_output_hist, plot_rollout
 
 _CP_LO, _CP_HI = CONTACT_POINT_BOUNDS
 _ANG_LO, _ANG_HI = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
@@ -102,6 +102,7 @@ _CP_MID = 0.5 * (_CP_LO + _CP_HI)
 _ANG_MID = 0.5 * (_ANG_LO + _ANG_HI)
 _CP_SCALE = _CP_HI - _CP_LO
 _ANG_SCALE = _ANG_HI - _ANG_LO
+
 
 class SurCoMLP(nn.Module):
     """Maps context y → solver parameters c (face logits + bounded cp/angle targets).
@@ -414,17 +415,13 @@ def _milp_backward(res, grad_x):
                     faces = []
                     for a in range(c_val.shape[1] // ACTION_DIM):
                         lo = a * ACTION_DIM
-                        face = int(np.argmax(x_val[k, env_idx, lo:lo+NUM_FACES]))
+                        face = int(np.argmax(x_val[k, env_idx, lo : lo + NUM_FACES]))
                         faces.append(face)
                     c_pert_str = np.array2string(c_perts_val[k, env_idx], precision=4, suppress_small=True)
                     print(f"  Rollout {k}: c_pert={c_pert_str}, face={faces}, cost={costs_val[k, env_idx]:.4f}")
 
         jax.debug.callback(
-            print_env_details,
-            c,
-            jnp.stack(c_pert_ks, axis=0),
-            jnp.stack(x_ks, axis=0),
-            costs_per_env_all
+            print_env_details, c, jnp.stack(c_pert_ks, axis=0), jnp.stack(x_ks, axis=0), costs_per_env_all
         )
     # cprint(
     #     f"  [backward]  gurobi ({M_ROLLOUTS * n_envs} solves): {t_gurobi * 1000:.0f} ms  |  "
@@ -464,6 +461,7 @@ milp_solver.defvjp(_milp_forward, _milp_backward)
 from dataclasses import dataclass
 from typing import Optional
 
+
 @dataclass
 class TrainingState:
     iteration_json_path: Path
@@ -497,7 +495,9 @@ class TrainingState:
             "pct_vs_baseline_per_env": None
             if self.pct_vs_baseline_per_env is None
             else np.asarray(self.pct_vs_baseline_per_env).tolist(),
-            "mean_pct_vs_baseline": None if self.pct_vs_baseline_per_env is None else float(np.nanmean(self.pct_vs_baseline_per_env)),
+            "mean_pct_vs_baseline": None
+            if self.pct_vs_baseline_per_env is None
+            else float(np.nanmean(self.pct_vs_baseline_per_env)),
             "t_poses": None if self.t_poses is None else np.asarray(self.t_poses).tolist(),
             "t_velocities": None if self.t_velocities is None else np.asarray(self.t_velocities).tolist(),
             "target_poses": None if self.target_poses is None else np.asarray(self.target_poses).tolist(),
@@ -896,9 +896,11 @@ def main(
             print(f"|____ baseline mean per env:  {np.round(baseline_means_np, 5).tolist()}")
             print(f"|____ % vs baseline per env:  {np.round(pct_vs_baseline, 3).tolist()}")
             print(f"|____ mean % vs baseline: {mean_pct_vs_baseline:.4f}%")
-        
+
         if verbosity > 0:
-            cprint(f"|____ mean_dist_change: {mean_dist_delta * 100:.3f} [cm]", "green" if mean_dist_delta < 0 else "red")
+            cprint(
+                f"|____ mean_dist_change: {mean_dist_delta * 100:.3f} [cm]", "green" if mean_dist_delta < 0 else "red"
+            )
             print(f"|____ dist_deltas_np=\n{dist_deltas_np}")
         cprint(
             f"|____ timing  fwd+bwd: {t_forward_backward * 1000:.0f} ms  "
@@ -1013,10 +1015,23 @@ def main(
                 save_filepath2=save_dir / f"latest.png",
                 open_after_save=False,
             )
+            t_poses_initial = np.asarray(jpos_traj[:, 0, [env._T_x_idx, env._T_y_idx, env._T_theta_idx]])
+            t_poses_final = np.asarray(jpos_traj[:, -1, [env._T_x_idx, env._T_y_idx, env._T_theta_idx]])
+            pusher_initial_positions = np.asarray(jpos_traj[:, 0, [env._pusher_x_idx, env._pusher_y_idx]])
+            rollout_save_filepath = save_dir / f"rollout_{it + 1:03d}.png"
+            plot_rollout(
+                save_dir=save_dir,
+                t_poses_initial=t_poses_initial,
+                t_poses_final=t_poses_final,
+                target_poses=env.target_poses,
+                pusher_initial_positions=pusher_initial_positions,
+                save_filepath=rollout_save_filepath,
+            )
             if use_wandb:
-                wandb.log({"plot": wandb.Image(str(save_dir / "latest.png"))}, step=it)
                 fig_out = plot_network_output_hist(np.asarray(c_batch), np.asarray(x_batch), it)
+                wandb.log({"plot": wandb.Image(str(save_dir / "latest.png"))}, step=it)
                 wandb.log({"c_figures/network_output_hist": wandb.Image(fig_out)}, step=it)
+                wandb.log({"rollout": wandb.Image(str(rollout_save_filepath))}, step=it)
                 plt.close(fig_out)
         if mean_dist_delta < lowest_mean_dist_delta and it > 0:
             lowest_mean_dist_delta = mean_dist_delta

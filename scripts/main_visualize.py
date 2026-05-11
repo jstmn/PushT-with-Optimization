@@ -20,75 +20,15 @@ from pusht619.core import (
     CONTACT_POINT_BOUNDS,
     NUM_FACES,
     get_action_cost_matrix_cache_filename,
-    get_t_and_target_corners,
     PushTEnv,
     Action,
-    FACE_START_POINTS,
-    FACE_END_POINTS,
-    T_CORNERS,
 )
+from pusht619.plotting_utils import draw_scene_visualization
 
 N_SIM_STEPS = 25
 N_GRID = 9
 
 FACE_DESCRIPTIONS = ["Left side of stem", "Bottom of stem", "Right side of stem", "Top of top bar"]
-
-
-def draw_scene_visualization(ax_scene, t_pose, target_pose):
-    """Draws the T block, target T block, and face labels on the given axes."""
-    t_corners, target_corners = get_t_and_target_corners(np.array([t_pose]), np.array([target_pose]))
-
-    # Plot target T (green)
-    tgt_poly = plt.Polygon(target_corners[0], closed=True, fill=True, facecolor="green", alpha=0.3, edgecolor="green")
-    ax_scene.add_patch(tgt_poly)
-
-    # Plot T (orange)
-    t_poly = plt.Polygon(t_corners[0], closed=True, fill=True, facecolor="orange", alpha=0.7, edgecolor="darkorange")
-    ax_scene.add_patch(t_poly)
-
-    # Add face labels to the T block
-    for face_idx in range(NUM_FACES):
-        # Get start and end points for this face from the T block corners
-        # Note: FACE_START_POINTS and FACE_END_POINTS correspond to specific indices in T_CORNERS
-        # We need to map them to the rotated corners
-
-        # Find the indices of the start and end points in T_CORNERS
-        start_idx = np.where(np.all(T_CORNERS == FACE_START_POINTS[face_idx], axis=1))[0][0]
-        end_idx = np.where(np.all(T_CORNERS == FACE_END_POINTS[face_idx], axis=1))[0][0]
-        p_start = t_corners[0, start_idx]
-        p_end = t_corners[0, end_idx]
-        midpoint = (p_start + p_end) / 2
-
-        # Add a small offset outward for the text
-        normal = np.array([-(p_end[1] - p_start[1]), p_end[0] - p_start[0]])
-        normal = normal / np.linalg.norm(normal)
-        text_pos = midpoint + normal * 0.02
-
-        ax_scene.text(
-            text_pos[0],
-            text_pos[1],
-            f"Face {face_idx}",
-            ha="center",
-            va="center",
-            fontsize=9,
-            fontweight="bold",
-            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1),
-        )
-
-        # Draw a line highlighting the face
-        ax_scene.plot([p_start[0], p_end[0]], [p_start[1], p_end[1]], "r-", linewidth=2)
-
-    ax_scene.set_aspect("equal")
-    ax_scene.set_title("Scene Visualization")
-    ax_scene.set_xlabel("X")
-    ax_scene.set_ylabel("Y")
-
-    # Set limits based on the block positions
-    all_pts = np.vstack([t_corners[0], target_corners[0]])
-    min_x, min_y = np.min(all_pts, axis=0) - 0.1
-    max_x, max_y = np.max(all_pts, axis=0) + 0.1
-    ax_scene.set_xlim(min_x, max_x)
-    ax_scene.set_ylim(min_y, max_y)
 
 
 def plot_for_env(t_pose, t_vel, target_pose, cp_vals, ang_vals, save_path, action_history=None):

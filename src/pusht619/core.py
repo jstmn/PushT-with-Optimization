@@ -1097,15 +1097,11 @@ class PushTEnv:
                 self._t_poses[:, 1] = rng_fixed.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
                 self._t_poses[:, 2] = rng_fixed.uniform(-np.pi, np.pi, size=self._nenvs)
 
-                # Special cases for 1 or 2 envs
-                if self._nenvs == 1:
-                    self._t_poses[:, 0] = WORKSPACE_WIDTH / 4
-                    self._t_poses[:, 1] = WORKSPACE_HEIGHT / 4
-                    self._t_poses[:, 2] = 0.0
-                elif self._nenvs == 2:
-                    self._t_poses[0, 0] = WORKSPACE_WIDTH / 4
-                    self._t_poses[0, 1] = WORKSPACE_HEIGHT / 4
-                    self._t_poses[0, 2] = 0.0
+                self._t_poses[0, 0] = WORKSPACE_WIDTH / 4
+                self._t_poses[0, 1] = WORKSPACE_HEIGHT / 4
+                self._t_poses[0, 2] = 0.0
+                # Special cases for more than 2 envs
+                if self._nenvs > 2:
                     self._t_poses[1, 0] = 3 * WORKSPACE_WIDTH / 4
                     self._t_poses[1, 1] = 3 * WORKSPACE_HEIGHT / 4
                     self._t_poses[1, 2] = 0.0
