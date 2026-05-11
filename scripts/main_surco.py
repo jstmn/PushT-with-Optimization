@@ -48,7 +48,7 @@ System design (SurCo-prior):
        x[6] ∈ CONTACT_POINT_BOUNDS  (continuous)
        x[7] ∈ ANGLE_BOUNDS          (continuous)
    Gradient via Berthet et al. 2020 randomized smoothing through the solve.
-3. Rollout via step_pure_soft (differentiable physics; one-hot face).
+3. Rollout via step_pure_soft (cost_differentiable physics; one-hot face).
 4. Loss: run one rollout using the clean Gurobi solution x* for the predicted
    face logits and continuous targets.
 5. Backprop through the rollout, then use randomized smoothing only in the
@@ -67,8 +67,9 @@ RANDOM_MODE="random-spawn__random-target" # hardest
 # Random mode examples
 python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --record-video
 python scripts/main_surco.py --n-envs 2  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --no-wandb --optimizer sgd
+python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
+python scripts/main_surco.py --n-envs 2  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
 python scripts/main_surco.py --n-envs 4  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
-python scripts/main_surco.py --n-envs 32 --verbosity 1 --random-mode ${RANDOM_MODE}
 """
 
 from __future__ import annotations
@@ -374,14 +375,14 @@ def _milp_backward(res, grad_x):
     for k_i in range(M_ROLLOUTS):
         # We divide diff by n_envs because task_loss is a mean over all envs,
         # so the gradient of the task_loss is 1/N * gradient of the env cost.
-        diff = (costs_per_env_all[k_i] - mean_cost_per_env) / n_envs
+        cost_diff = (costs_per_env_all[k_i] - mean_cost_per_env) / n_envs
         eps_f = eps_faces[k_i]
 
         for action_idx in range(n_actions):
             lo = action_idx * ACTION_DIM
 
             grad_c_face = grad_c_face.at[:, lo : lo + NUM_FACES].add(
-                eps_f[:, lo : lo + NUM_FACES] * diff[:, None] / (M_ROLLOUTS * PERTURB_LAMBDA)
+                eps_f[:, lo : lo + NUM_FACES] * cost_diff[:, None] / (M_ROLLOUTS * PERTURB_LAMBDA)
             )
 
             if USE_MC_FOR_CONTINUOUS_GRADIENTS:
@@ -390,7 +391,7 @@ def _milp_backward(res, grad_x):
                 # grad = true_eps / std * cost = eps_f / (CONTINUOUS_PERTURB_SCALE**2 * PERTURB_LAMBDA) * cost
                 grad_c_mc_cont = grad_c_mc_cont.at[:, lo + NUM_FACES : lo + NUM_FACES + 2].add(
                     eps_f[:, lo + NUM_FACES : lo + NUM_FACES + 2]
-                    * diff[:, None]
+                    * cost_diff[:, None]
                     / (M_ROLLOUTS * PERTURB_LAMBDA * (CONTINUOUS_PERTURB_SCALE**2))
                 )
 
