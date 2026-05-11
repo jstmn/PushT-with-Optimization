@@ -10,84 +10,40 @@ from pusht619.core import ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES
 
 
 def plot_results(
-    save_dir,
-    means,
-    stds,
-    dist_delta_hist,
+    dist_change_hist,
     face_hist,
     cp_hist,
     ang_hist,
     n_envs,
-    n_sim_steps,
     n_opt_steps,
     random_mode: str,
     m_rollouts: int,
     perturb_lambda: float,
-    relative_coordinates: bool = False,
-    random_means=None,
-    random_stds=None,
-    baseline_iters=None,
+    relative_coordinates: bool,
     save_filepath=None,
     save_filepath2=None,
     open_after_save=False,
 ):
-    initial_mean_loss = means[0]
-    x_iters = np.arange(len(means))
-    has_random_baseline = random_means is not None and random_stds is not None
-    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  "
         f"n_opt_steps={n_opt_steps}  M={m_rollouts}  λ={perturb_lambda}  "
         f"RANDOM_MODE={random_mode}  RELATIVE_COORDINATES={relative_coordinates}",
         fontweight="bold",
     )
-    ax_mean, ax_std = axes[0, 0], axes[0, 1]
-    ax_cp, ax_ang = axes[1, 0], axes[1, 1]
-    ax_face, ax_delta = axes[2, 0], axes[2, 1]
+    ax_cp, ax_ang = axes[0, 0], axes[0, 1]
+    ax_face, ax_dist = axes[1, 0], axes[1, 1]
     n_envs_max = min(n_envs, 7)
 
-    ax_mean.axhline(float(initial_mean_loss), label="initial mean", color="black", linestyle="--")
-    ax_mean.plot(x_iters, means, label="training mean", color="tab:red")
-    ax_mean.legend()
-    ax_mean.set_title("Mean Final Distance")
-    ax_mean.set_xlabel("Iteration")
-    ax_mean.set_ylabel("Distance [m]")
-    ax_mean.grid(True, alpha=0.3)
-
-    if has_random_baseline:
-        bx = np.asarray(baseline_iters) if baseline_iters is not None else np.arange(len(random_means))
-        ax_std.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-        ax_std.plot(bx, random_means, label="mean % vs baseline", color="tab:green")
-        ax_std.fill_between(
-            bx,
-            np.asarray(random_means) - np.asarray(random_stds),
-            np.asarray(random_means) + np.asarray(random_stds),
-            color="tab:green",
-            alpha=0.2,
-            label="± std across envs",
-        )
-        ax_std.legend()
-        ax_std.set_title("% vs Center-Action Baseline")
-        ax_std.set_xlabel("Iteration")
-        ax_std.set_ylabel("% change (negative = better)")
-    else:
-        ax_std.plot(x_iters, stds, label="training std", color="tab:red")
-        ax_std.legend()
-        ax_std.set_title("Final Distance Std")
-        ax_std.set_xlabel("Iteration")
-        ax_std.set_ylabel("Std [m]")
-    ax_std.grid(True, alpha=0.3)
-
-    mean_delta = [float(np.nanmean(delta)) for delta in dist_delta_hist]
-    ax_delta.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-    ax_delta.plot(mean_delta, color="black", linewidth=2.0, label="mean")
+    mean_dist_change = [float(np.mean(dists)) for dists in dist_change_hist]
+    ax_dist.plot(mean_dist_change, color="black", linewidth=2.0, label="mean")
     for env_idx in range(n_envs_max):
-        ax_delta.plot([delta[env_idx] for delta in dist_delta_hist], label=f"env {env_idx}", alpha=0.8)
-    ax_delta.legend()
-    ax_delta.set_title("Distance Change Per Env")
-    ax_delta.set_xlabel("Iteration")
-    ax_delta.set_ylabel("Delta from Iter 1 [m]")
-    ax_delta.grid(True, alpha=0.3)
+        ax_dist.plot([dists[env_idx] for dists in dist_change_hist], label=f"env {env_idx}", alpha=0.8)
+    ax_dist.legend()
+    ax_dist.set_title("Distance Change Per Env during rollout (Final - Initial)")
+    ax_dist.set_xlabel("Iteration")
+    ax_dist.set_ylabel("Distance Change [cm]")
+    ax_dist.grid(True, alpha=0.3)
 
     for env_idx in range(n_envs_max):
         x1 = np.arange(len(cp_hist))
@@ -124,12 +80,11 @@ def plot_results(
     ax_face.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    if save_filepath is None:
-        save_filepath = save_dir / "surco_prior.png"
     plt.savefig(save_filepath, bbox_inches="tight")
+    print(f"Saved plot to {save_filepath}")
     if save_filepath2 is not None:
         plt.savefig(save_filepath2, bbox_inches="tight")
-    print(f"Saved plot to {save_filepath}")
+        print(f"Saved plot to {save_filepath2}")
     plt.close()
     if open_after_save:
         print(f"xdg-open {save_filepath}")

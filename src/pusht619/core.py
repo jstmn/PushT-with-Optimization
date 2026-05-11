@@ -1092,6 +1092,12 @@ class PushTEnv:
                 self._t_poses[:, 2] = rng.uniform(-np.pi, np.pi, size=self._nenvs)
             elif "fixed-spawn" in self._random_mode:
                 self._t_poses = np.zeros((self._nenvs, 3), dtype=np.float32)
+                rng_fixed = np.random.default_rng(0)
+                self._t_poses[:, 0] = rng_fixed.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
+                self._t_poses[:, 1] = rng_fixed.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
+                self._t_poses[:, 2] = rng_fixed.uniform(-np.pi, np.pi, size=self._nenvs)
+
+                # Special cases for 1 or 2 envs
                 if self._nenvs == 1:
                     self._t_poses[:, 0] = WORKSPACE_WIDTH / 4
                     self._t_poses[:, 1] = WORKSPACE_HEIGHT / 4
@@ -1103,11 +1109,6 @@ class PushTEnv:
                     self._t_poses[1, 0] = 3 * WORKSPACE_WIDTH / 4
                     self._t_poses[1, 1] = 3 * WORKSPACE_HEIGHT / 4
                     self._t_poses[1, 2] = 0.0
-                else:
-                    rng_fixed = np.random.default_rng(0)
-                    self._t_poses[:, 0] = rng_fixed.uniform(T_RADIUS, WORKSPACE_WIDTH - T_RADIUS, size=self._nenvs)
-                    self._t_poses[:, 1] = rng_fixed.uniform(T_RADIUS, WORKSPACE_HEIGHT - T_RADIUS, size=self._nenvs)
-                    self._t_poses[:, 2] = rng_fixed.uniform(-np.pi, np.pi, size=self._nenvs)
             else:
                 raise ValueError(f"Unknown random_mode for spawn: {self._random_mode}")
         else:

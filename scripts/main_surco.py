@@ -66,7 +66,7 @@ RANDOM_MODE="random-spawn__random-target" # hardest
 
 # Random mode examples
 python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --record-video
-python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --no-wandb --optimizer sgd
+python scripts/main_surco.py --n-envs 2  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --no-wandb --optimizer sgd
 python scripts/main_surco.py --n-envs 2  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
 python scripts/main_surco.py --n-envs 32 --verbosity 1 --random-mode ${RANDOM_MODE}
 """
@@ -401,6 +401,28 @@ def _milp_backward(res, grad_x):
 
     if verbosity > 1:
         jax.debug.print("  mc_rollout_cost_mean={mc_rollout_cost_mean}", mc_rollout_cost_mean=mc_rollout_cost_mean)
+
+        def print_env_details(c_val, c_perts_val, x_val, costs_val):
+            for env_idx in range(c_val.shape[0]):
+                print(f"--- Env {env_idx} ---")
+                c_str = np.array2string(c_val[env_idx], precision=4, suppress_small=True)
+                print(f"  c: {c_str}")
+                for k in range(c_perts_val.shape[0]):
+                    faces = []
+                    for a in range(c_val.shape[1] // ACTION_DIM):
+                        lo = a * ACTION_DIM
+                        face = int(np.argmax(x_val[k, env_idx, lo:lo+NUM_FACES]))
+                        faces.append(face)
+                    c_pert_str = np.array2string(c_perts_val[k, env_idx], precision=4, suppress_small=True)
+                    print(f"  Rollout {k}: c_pert={c_pert_str}, face={faces}, cost={costs_val[k, env_idx]:.4f}")
+
+        jax.debug.callback(
+            print_env_details,
+            c,
+            jnp.stack(c_pert_ks, axis=0),
+            jnp.stack(x_ks, axis=0),
+            costs_per_env_all
+        )
     # cprint(
     #     f"  [backward]  gurobi ({M_ROLLOUTS * n_envs} solves): {t_gurobi * 1000:.0f} ms  |  "
     #     f"physics rollouts + grad: {t_physics * 1000:.0f} ms",
@@ -436,43 +458,48 @@ def _milp_backward(res, grad_x):
 milp_solver.defvjp(_milp_forward, _milp_backward)
 
 
-def save_json(
-    iteration_json_path,
-    iteration,
-    loss,
-    mean_final_dist,
-    final_dists_np,
-    c_batch,
-    x_batch,
-    grad_c,
-    baseline_means_per_env=None,  # (nenvs,) or None
-    pct_vs_baseline_per_env=None,  # (nenvs,) or None
-    grad_x=None,
-    t_poses=None,
-    t_velocities=None,
-    target_poses=None,
-):
-    iteration_payload = {
-        "iteration": iteration,
-        "loss": float(loss),
-        "mean_final_distance": mean_final_dist,
-        "final_distance_per_env": final_dists_np.tolist(),
-        "c": np.asarray(c_batch).tolist(),
-        "x": x_batch.tolist(),
-        "dloss_dc": grad_c.tolist() if grad_c is not None else None,
-        "dloss_dx": None if grad_x is None else np.asarray(grad_x).tolist(),
-        "baseline_mean_per_env": None
-        if baseline_means_per_env is None
-        else np.asarray(baseline_means_per_env).tolist(),
-        "pct_vs_baseline_per_env": None
-        if pct_vs_baseline_per_env is None
-        else np.asarray(pct_vs_baseline_per_env).tolist(),
-        "mean_pct_vs_baseline": None if pct_vs_baseline_per_env is None else float(np.nanmean(pct_vs_baseline_per_env)),
-        "t_poses": None if t_poses is None else np.asarray(t_poses).tolist(),
-        "t_velocities": None if t_velocities is None else np.asarray(t_velocities).tolist(),
-        "target_poses": None if target_poses is None else np.asarray(target_poses).tolist(),
-    }
-    iteration_json_path.write_text(json.dumps(iteration_payload, indent=2))
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class TrainingState:
+    iteration_json_path: Path
+    iteration: int
+    loss: float
+    mean_dist_delta: float
+    final_dists_np: np.ndarray
+    c_batch: np.ndarray
+    x_batch: np.ndarray
+    grad_c: Optional[np.ndarray] = None
+    baseline_means_per_env: Optional[np.ndarray] = None
+    pct_vs_baseline_per_env: Optional[np.ndarray] = None
+    grad_x: Optional[np.ndarray] = None
+    t_poses: Optional[np.ndarray] = None
+    t_velocities: Optional[np.ndarray] = None
+    target_poses: Optional[np.ndarray] = None
+
+    def save_json(self):
+        iteration_payload = {
+            "iteration": self.iteration,
+            "loss": float(self.loss),
+            "mean_dist_delta": float(self.mean_dist_delta),
+            "final_distance_per_env": self.final_dists_np.tolist(),
+            "c": np.asarray(self.c_batch).tolist(),
+            "x": self.x_batch.tolist(),
+            "dloss_dc": self.grad_c.tolist() if self.grad_c is not None else None,
+            "dloss_dx": None if self.grad_x is None else np.asarray(self.grad_x).tolist(),
+            "baseline_mean_per_env": None
+            if self.baseline_means_per_env is None
+            else np.asarray(self.baseline_means_per_env).tolist(),
+            "pct_vs_baseline_per_env": None
+            if self.pct_vs_baseline_per_env is None
+            else np.asarray(self.pct_vs_baseline_per_env).tolist(),
+            "mean_pct_vs_baseline": None if self.pct_vs_baseline_per_env is None else float(np.nanmean(self.pct_vs_baseline_per_env)),
+            "t_poses": None if self.t_poses is None else np.asarray(self.t_poses).tolist(),
+            "t_velocities": None if self.t_velocities is None else np.asarray(self.t_velocities).tolist(),
+            "target_poses": None if self.target_poses is None else np.asarray(self.target_poses).tolist(),
+        }
+        self.iteration_json_path.write_text(json.dumps(iteration_payload, indent=2))
 
 
 def center_action_baseline(
@@ -517,10 +544,13 @@ def main(
     lr: float | None = None,
     perturb_lambda: float | None = None,
     optimizer_type: str = "adam",
+    n_opt_steps: int | None = None,
 ):
-    global _CURRENT_ITERATION, PERTURB_LAMBDA
+    global _CURRENT_ITERATION, PERTURB_LAMBDA, N_OPT_STEPS
     if perturb_lambda is not None:
         PERTURB_LAMBDA = perturb_lambda
+    if n_opt_steps is not None:
+        N_OPT_STEPS = n_opt_steps
     assert problem_type in ["single_step", "multi_step"], "problem_type must be 'single_step' or 'multi_step'."
     assert verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     is_multi_step = multi_step_n_actions is not None
@@ -716,28 +746,13 @@ def main(
     # grad_wrt_c = jax.grad(lambda c, data, rng_solve: cost_from_c(c, data, rng_solve, 0, False)[0], argnums=0)
 
     print("SurCo-prior: training NN  y → solver params  (Gurobi + randomized-smoothing VJP)")
-    if n_envs < 16:
-        cprint(
-            f"WARNING: n_envs={n_envs} may produce noisy gradients; training is typically more stable with larger batches (e.g. 16+ envs).",
-            "yellow",
-        )
-
-    means = []
-    stds = []
-    random_means = []
-    random_stds = []
-    baseline_iters = []  # iteration indices where baseline was evaluated
-    dist_delta_hist = []  # list of (n_envs,) float — change in final distance from iter 1 per env
+    dist_change_hist = []  # list of (n_envs,) float — change in distance from start of rollout per env
     face_hist = []  # list of (n_envs,) int — argmax face per env per iter
     cp_hist = []  # list of (n_envs,) float — contact_point per env per iter
     ang_hist = []  # list of (n_envs,) float — angle per env per iter
     c_face_hist = []  # list of (n_envs, NUM_FACES) float — face logits per env per iter
 
-    n_envs_better_0 = None
-    initial_mean_final_dist = None
-    initial_final_dists = None
-    initial_faces = None
-    lowest_mean_final_dist = float("inf")
+    lowest_mean_dist_delta = float("inf")
     t_start = time()
 
     for it in range(N_OPT_STEPS):
@@ -745,6 +760,7 @@ def main(
         if it == 0:
             print(f"Program loading time: {time() - PROGRAM_START_TIME:.2f} s")
 
+        print()
         print()
         print(f"|  ────────────────────────────────────────────────────────────────────────────────────────────  |")
         print(
@@ -824,9 +840,8 @@ def main(
 
         final_dists_np = np.asarray(t_distances[:, -1])
         initial_dists_np = np.asarray(t_distances[:, 0])
-        mean_final_dist = float(np.nanmean(final_dists_np))
-        mean_initial_dist = float(np.nanmean(initial_dists_np))
-        mean_dist_change = mean_final_dist - mean_initial_dist
+        dist_deltas_np = final_dists_np - initial_dists_np
+        mean_dist_delta = float(np.mean(dist_deltas_np))
         face_idx_np = np.asarray(jnp.argmax(face_weights, axis=-1))
         face_hist_current = face_idx_np[:, 0] if is_multi_step else face_idx_np
         cp_hist_current = np.asarray(cp_batch[:, 0] if is_multi_step else cp_batch)
@@ -856,35 +871,9 @@ def main(
 
         # Print results
         #
-        if initial_mean_final_dist is None:
-            initial_mean_final_dist = float(np.nanmean(initial_dists_np))
-        if initial_final_dists is None:
-            initial_final_dists = final_dists_np.copy()
-        if initial_faces is None:
-            initial_faces = face_idx_np.copy()
-        if random_mode == "fixed-spawn__fixed-target" and it > 0:
-            if is_eval_step:
-                cprint(f"|____ eval step: using environment from iteration 0", "cyan")
-            if n_envs_better_0 is None:
-                n_envs_better_0 = sum(final_dists_np < initial_mean_final_dist - 0.05)
-            delta_cm = 100 * (mean_final_dist - initial_mean_final_dist)
-            initial_str = (
-                f" | initial mean @ t=0: {initial_mean_final_dist:.5f} [m]" if not "random" in random_mode else ""
-            )
-            cprint(
-                f"|____ mean_final_dist: {mean_final_dist:.5f} [m] | mean_dist_change: {mean_dist_change * 100:.3f} [cm] | delta from t=0: {delta_cm:.3f} [cm]{initial_str}",
-                "green" if mean_dist_change < 0 else "red",
-            )
-            n_envs_better = sum(final_dists_np < initial_mean_final_dist - 0.05)
-            cprint(
-                f"|____ {n_envs_better} / {n_envs} envs are better than the initial mean, initial: {n_envs_better_0}",
-                "green" if n_envs_better > n_envs_better_0 else "red",
-            )
         print(f"faces=          {face_idx_np[:, 0]}")
         print(f"angles=         {ang_hist_current[:, 0]}")
         print(f"contact-points= {cp_hist_current[:, 0]}")
-        print(f"\n|____ face initial= {initial_faces[:, 0]}")
-        print(f"|____ face diff=    {(face_idx_np - initial_faces)[:, 0]}")
         baseline_means_np = None
         pct_vs_baseline = None
         mean_pct_vs_baseline = None
@@ -904,6 +893,11 @@ def main(
             print(f"|____ baseline mean per env:  {np.round(baseline_means_np, 5).tolist()}")
             print(f"|____ % vs baseline per env:  {np.round(pct_vs_baseline, 3).tolist()}")
             print(f"|____ mean % vs baseline: {mean_pct_vs_baseline:.4f}%")
+        
+        if verbosity > 0:
+            cprint(f"|____ mean_dist_change: {mean_dist_delta * 100:.3f} [cm]", "green" if mean_dist_delta < 0 else "red")
+        if verbosity > 1:
+            print(f"|____ dist_deltas_np=\n{dist_deltas_np}")
         cprint(
             f"|____ timing  fwd+bwd: {t_forward_backward * 1000:.0f} ms  "
             # f"grad_c: {t_grad_c*1000:.0f} ms  "
@@ -912,22 +906,23 @@ def main(
             f"total: {dt * 1000:.0f} ms",
             "white",
         )
-        save_json(
-            iterations_dir / f"{it:03d}.json",
-            it,
-            loss,
-            mean_final_dist,
-            final_dists_np,
-            c_batch,
-            x_batch,
-            None,  # grad_c
-            baseline_means_np,
-            pct_vs_baseline,
+        state = TrainingState(
+            iteration_json_path=iterations_dir / f"{it:03d}.json",
+            iteration=it,
+            loss=float(loss),
+            mean_dist_delta=mean_dist_delta,
+            final_dists_np=final_dists_np,
+            c_batch=c_batch,
+            x_batch=x_batch,
+            grad_c=None,
+            baseline_means_per_env=baseline_means_np,
+            pct_vs_baseline_per_env=pct_vs_baseline,
             grad_x=_LAST_GRAD_X,
             t_poses=env.t_poses,
             t_velocities=env.t_velocities,
             target_poses=env.target_poses,
         )
+        state.save_json()
 
         # Print gradient statistics
         #
@@ -936,6 +931,7 @@ def main(
             grad_abs_values = [jnp.abs(g) for g in jax.tree_util.tree_leaves(g_params)]
             max_grad = max(jnp.max(g).item() for g in grad_abs_values)
             mean_grad = float(jnp.mean(jnp.array([jnp.mean(g).item() for g in grad_abs_values])))
+            print()
             print(f"|____ max |grad|: {max_grad:.6f}, mean |grad|: {mean_grad:.6f}")
 
         if use_wandb:
@@ -946,9 +942,9 @@ def main(
                 "loss/face_logit_regularization": float(face_logit_regularization),
                 "loss/cp_regularization": float(cp_regularization),
                 "loss/angle_regularization": float(angle_regularization),
-                "mean_final_dist": mean_final_dist,
-                "mean_dist_change": mean_dist_change,
-                "std_final_dist": float(np.nanstd(final_dists_np)),
+                "mean_dist_change": mean_dist_delta,
+                "mean_final_dist": float(np.mean(final_dists_np)),
+                "std_final_dist": float(np.std(final_dists_np)),
                 "n_nan_envs": len(nan_envs),
                 "n_bad_grads": n_bad_grads,
                 "time/iterations_per_second": 1.0 / dt,
@@ -988,13 +984,7 @@ def main(
 
         # Log results for plotting
         #
-        means.append(float(np.nanmean(final_dists_np)))
-        stds.append(float(np.nanstd(final_dists_np)))
-        if mean_pct_vs_baseline is not None and pct_vs_baseline is not None:
-            random_means.append(mean_pct_vs_baseline)
-            random_stds.append(float(np.nanstd(pct_vs_baseline)))
-            baseline_iters.append(it)
-        dist_delta_hist.append(final_dists_np - initial_final_dists)
+        dist_change_hist.append(final_dists_np - initial_dists_np)
         face_hist.append(face_hist_current)
         cp_hist.append(cp_hist_current)
         ang_hist.append(ang_hist_current)
@@ -1007,23 +997,16 @@ def main(
             save_mlp_weights(filepath, params)
             cprint(f"|____ saved weights to {filepath}", "yellow")
             plot_results(
-                save_dir=save_dir,
-                means=means,
-                stds=stds,
-                dist_delta_hist=dist_delta_hist,
+                dist_change_hist=dist_change_hist,
                 face_hist=face_hist,
                 cp_hist=cp_hist,
                 ang_hist=ang_hist,
                 n_envs=n_envs,
-                n_sim_steps=N_SIM_STEPS,
                 n_opt_steps=N_OPT_STEPS,
+                random_mode=random_mode,
                 m_rollouts=M_ROLLOUTS,
                 perturb_lambda=PERTURB_LAMBDA,
-                random_mode=random_mode,
                 relative_coordinates=True,
-                random_means=random_means if random_means else None,
-                random_stds=random_stds if random_stds else None,
-                baseline_iters=baseline_iters if baseline_iters else None,
                 save_filepath=save_dir / f"{it + 1:03d}.png",
                 save_filepath2=save_dir / f"latest.png",
                 open_after_save=False,
@@ -1033,10 +1016,10 @@ def main(
                 fig_out = plot_network_output_hist(np.asarray(c_batch), np.asarray(x_batch), it)
                 wandb.log({"c_figures/network_output_hist": wandb.Image(fig_out)}, step=it)
                 plt.close(fig_out)
-        if mean_final_dist < lowest_mean_final_dist and it > 0:
-            lowest_mean_final_dist = mean_final_dist
-            cprint(f"New lowest mean dist: {lowest_mean_final_dist:.5f} [m]", "green")
-            filepath = checkpoints_dir / f"mlp_lowest_mean_final_dist.npz"
+        if mean_dist_delta < lowest_mean_dist_delta and it > 0:
+            lowest_mean_dist_delta = mean_dist_delta
+            cprint(f"New lowest mean dist: {lowest_mean_dist_delta:.5f} [m]", "green")
+            filepath = checkpoints_dir / f"mlp_lowest_mean_dist_delta.npz"
             save_mlp_weights(filepath, params)
             if record_video:
                 save_filepath = save_dir / f"best.mp4"
@@ -1082,6 +1065,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
     parser.add_argument("--perturb-lambda", type=float, help="Randomized smoothing scale (PERTURB_LAMBDA)")
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"], help="Optimizer to use")
+    parser.add_argument("--n-opt-steps", type=int, default=1000, help="Number of optimization steps")
     args = parser.parse_args()
     assert args.verbosity in [0, 1, 2], "Verbosity must be 0, 1, or 2."
     assert args.n_envs is not None, "n_envs must be specified"
@@ -1097,4 +1081,5 @@ if __name__ == "__main__":
         lr=args.lr,
         perturb_lambda=args.perturb_lambda,
         optimizer_type=args.optimizer,
+        n_opt_steps=args.n_opt_steps,
     )

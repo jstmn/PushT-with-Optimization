@@ -5,7 +5,7 @@ where each subplot is a 2D heatmap showing the difference in final distance
 (final_distance - initial_distance) for a grid of 5x5 contact points and angles.
 
 
-python scripts/main_visualize.py --iterations-dir logs/10__15:56:55__n-envs:2__lr:0.05__fixed-spawn__fixed-target__single-step/iterations
+python scripts/main_visualize.py --iterations-dir logs/10__18:19:26__n-envs:2__lr:0.05__fixed-spawn__fixed-target__single-step/iterations
 """
 
 import argparse
