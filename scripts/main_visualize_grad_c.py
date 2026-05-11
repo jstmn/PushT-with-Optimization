@@ -15,22 +15,19 @@ python scripts/main_visualize_grad_c.py --n-envs 4 --n-mc-envs 9 --backward-dir 
 ACTION_DIM = 6
 
 
-def plot_gradients_for_face(ax, iterations, c_vals, grads, c_range, face_idx, max_grad):
+def plot_gradients_for_face(ax, iterations, c_vals, grads, face_idx, max_grad):
 
     ax.plot(iterations, c_vals, label=f"Face {face_idx} Logit (c)", color="blue", linewidth=2)
 
-    assert c_vals.shape == (len(iterations), ), f"c_vals.shape: {c_vals.shape}"
-    assert grads.shape == (len(iterations), ), f"grads.shape: {grads.shape}"
+    assert c_vals.shape == (len(iterations),), f"c_vals.shape: {c_vals.shape}"
+    assert grads.shape == (len(iterations),), f"grads.shape: {grads.shape}"
 
     for i, (x, y, g) in enumerate(zip(iterations, c_vals, grads)):
         if abs(g) > 1e-4:
             direction = 1 if g > 0 else -1
             color = "red" if g > 0 else "green"
 
-            # Scale arrow length slightly based on magnitude, but keep it visible
-            arrow_length = 0.5 * (abs(g) / max_grad) * c_range
-            if arrow_length < 0.05 * c_range:
-                arrow_length = 0.05 * c_range
+            arrow_length = 0.5 * (abs(g) / max_grad)
 
             ax.annotate(
                 "",
@@ -38,27 +35,56 @@ def plot_gradients_for_face(ax, iterations, c_vals, grads, c_range, face_idx, ma
                 xytext=(x, y),
                 arrowprops=dict(arrowstyle="->", color=color, lw=1.5, alpha=0.7),
             )
-        else:
-            print(f"skipping gradient for face {face_idx} at iteration {i} because it is too small: {g}")
 
 
-def plot_c_and_grads_by_face(iterations: np.ndarray, c_env: np.ndarray, c_env_perturbed: np.ndarray, c_env_cost: np.ndarray, c_env_perturbed_costs: np.ndarray,  mc_grad_c: np.ndarray, n_mc_envs: int, save_path: str):
+def plot_c_and_grads_by_face(
+    iterations: np.ndarray,
+    c_env: np.ndarray,
+    c_env_perturbed: np.ndarray,
+    c_env_cost: np.ndarray,
+    c_env_perturbed_costs: np.ndarray,
+    mc_grad_c: np.ndarray,
+    n_mc_envs: int,
+    save_path: str,
+    x_perturbed: np.ndarray,
+    env_chosen_face: np.ndarray,
+):
     """Same as plot_c_and_grads but there are NUM_FACES subplots, one for each face. Each subplot only shows the
     gradients that are from the randomly drawn pertrubation offsets that correspond to the particular face.
     """
     n_iters = len(iterations)
-    assert c_env.shape == (n_iters, ACTION_DIM, )
-    assert c_env_cost.shape == (n_iters, )
+    assert c_env.shape == (
+        n_iters,
+        ACTION_DIM,
+    )
+    assert c_env_cost.shape == (n_iters,)
     assert c_env_perturbed.shape == (n_iters, n_mc_envs, ACTION_DIM)
     assert c_env_perturbed_costs.shape == (n_iters, n_mc_envs)
+    c_env = c_env[:, :NUM_FACES]
+    mc_grad_c = mc_grad_c[:, :NUM_FACES]
+    c_env_perturbed = c_env_perturbed[:, :, :NUM_FACES]
 
-    fig, axes = plt.subplots(NUM_FACES, NUM_FACES + 1, figsize=(12, 10), sharex=True)
-    min_c = np.min(c_env)
-    max_c = np.max(c_env)
-    c_range = max_c - min_c
-    y_min = min_c - 0.1 * c_range
-    y_max = max_c + 0.1 * c_range
+    fig = plt.figure(figsize=(16, 11))
+    gs = fig.add_gridspec(NUM_FACES, NUM_FACES + 1)
+    # gs = fig.add_gridspec(NUM_FACES + 1, NUM_FACES + 1)
 
+    axes = np.empty((NUM_FACES, NUM_FACES + 1), dtype=object)
+    for i in range(NUM_FACES):
+        for j in range(NUM_FACES + 1):
+            if i == 0 and j == 0:
+                axes[i, j] = fig.add_subplot(gs[i, j])
+            else:
+                axes[i, j] = fig.add_subplot(gs[i, j], sharex=axes[0, 0], sharey=axes[0, 0])
+            axes[i, j].grid(True, alpha=0.3)
+            plt.setp(axes[i, j].get_xticklabels(), visible=False)
+            if j > 0:
+                plt.setp(axes[i, j].get_yticklabels(), visible=False)
+
+    axes[0, 0].set_title("Combined Gradients", fontsize=10)
+    axes[0, 1].set_title("Gradients from Environments\nwhere Face 0 is Chosen Action", fontsize=10)
+    axes[0, 2].set_title("Gradients from Environments\nwhere Face 1 is Chosen Action", fontsize=10)
+    axes[0, 3].set_title("Gradients from Environments\nwhere Face 2 is Chosen Action", fontsize=10)
+    axes[0, 4].set_title("Gradients from Environments\nwhere Face 3 is Chosen Action", fontsize=10)
 
     # Show the total gradient for each face in the first column
     max_grad = np.max(np.abs(mc_grad_c))
@@ -66,31 +92,43 @@ def plot_c_and_grads_by_face(iterations: np.ndarray, c_env: np.ndarray, c_env_pe
         ax = axes[face_idx, 0]
         c_vals = c_env[:, face_idx]
         grads = mc_grad_c[:, face_idx]
-        plot_gradients_for_face(ax, iterations, c_vals, grads, c_range, face_idx, max_grad)
-        ax.set_ylabel(f"Face {face_idx}\nLogit")
-        ax.set_ylim(y_min, y_max)
+        plot_gradients_for_face(ax, iterations, c_vals, grads, face_idx, max_grad)
+        ax.set_ylabel(f"Face {face_idx}")
         ax.grid(True, alpha=0.3)
 
-
-    # 
+    #
     for i in range(NUM_FACES):
-        mean_grads = np.zeros((n_iters, ACTION_DIM))
+        mean_grads = np.zeros((n_iters, NUM_FACES))
 
         for it_idx in range(n_iters):
-            # Get indices of rows where the argmin (across first 4 columns) is i
-            c_perturb_matching_idxs = np.where(np.argmin(c_env_perturbed[it_idx, :NUM_FACES], axis=1) == i)[0]
+            # Get indices of rows where the chosen face is i
+            c_perturb_matching_idxs = np.where(np.argmax(x_perturbed[it_idx, :, :NUM_FACES], axis=1) == i)[0]
+
+            if len(c_perturb_matching_idxs) == 0:
+                continue
 
             for idx in c_perturb_matching_idxs:
                 cost_diff = c_env_perturbed_costs[it_idx, idx] - c_env_cost[it_idx]
-                mean_grads[it_idx, :] += cost_diff * (c_env_perturbed[it_idx, idx] - c_env[it_idx]) / len(c_perturb_matching_idxs)
+                c_delta = c_env_perturbed[it_idx, idx] - c_env[it_idx]
+                mean_grads[it_idx, :] += cost_diff * c_delta
+            mean_grads[it_idx, :] /= len(c_perturb_matching_idxs)
 
         for j in range(NUM_FACES):
-            ax = axes[j, i+1]
+            ax = axes[j, i + 1]
             c_vals = c_env[:, j]
             mean_grads_face = mean_grads[:, j]
-            plot_gradients_for_face(ax, iterations, c_vals, mean_grads_face, c_range, face_idx, max_grad)
+            plot_gradients_for_face(ax, iterations, c_vals, mean_grads_face, face_idx, max_grad)
 
-    fig.suptitle("Face Logits (c) and Gradients over Iterations")
+    # ax_bottom = fig.add_subplot(gs[NUM_FACES, :], sharex=axes[0, 0])
+    # ax_bottom.scatter(iterations, env_chosen_face, color="purple", marker="o")
+    # ax_bottom.plot(iterations, env_chosen_face, color="purple", alpha=0.3)
+    # ax_bottom.set_ylim(-0.25, NUM_FACES + 0.25)
+    # ax_bottom.set_yticks(range(NUM_FACES))
+    # ax_bottom.set_ylabel("Chosen Face")
+    # ax_bottom.set_xlabel("Iteration")
+    # ax_bottom.grid(True, alpha=0.3)
+
+    fig.suptitle("Face Logits (c) and Gradients over Iterations", fontsize=12, fontweight="bold")
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close(fig)
@@ -100,23 +138,22 @@ def plot_c_and_grads_by_face(iterations: np.ndarray, c_env: np.ndarray, c_env_pe
 
 def plot_c_and_grads(iterations, c, grad_c, env_chosen_face, save_path):
     fig, axes = plt.subplots(NUM_FACES + 1, 1, figsize=(12, 10), sharex=True)
+    c = c[:, :NUM_FACES]
 
     min_c = np.min(c)
     max_c = np.max(c)
     c_range = max_c - min_c
-    y_min = min_c
-    y_max = max_c
-    # y_min = min_c - 0.25 * c_range
-    # y_max = max_c + 0.25 * c_range
+    y_min = min_c - 0.2 * c_range
+    y_max = max_c + 0.2 * c_range
     max_grad = np.max(np.abs(grad_c))
 
     for face_idx in range(NUM_FACES):
         ax = axes[face_idx]
         c_vals = c[:, face_idx]
         grads = grad_c[:, face_idx]
-        plot_gradients_for_face(ax, iterations, c_vals, grads, c_range, face_idx, max_grad)
+        plot_gradients_for_face(ax, iterations, c_vals, grads, face_idx, max_grad)
 
-        ax.set_ylabel(f"Face {face_idx}\nLogit")
+        ax.set_ylabel(f"Face {face_idx}")
         ax.set_ylim(y_min, y_max)
         ax.grid(True, alpha=0.3)
 
@@ -134,14 +171,14 @@ def plot_c_and_grads(iterations, c, grad_c, env_chosen_face, save_path):
     plt.savefig(save_path)
     plt.close(fig)
     print(f"Saved plot to {save_path}")
-    return
+
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize grad_c_face from backward pass logs.")
     parser.add_argument(
         "--backward-dir", type=str, required=True, help="Path to the backward logs directory containing .npz files"
     )
-    parser.add_argument("--max-iterations", type=int, default=20, help="Maximum number of iterations to visualize")
+    parser.add_argument("--max-iterations", type=int, default=250, help="Maximum number of iterations to visualize")
     parser.add_argument("--n-envs", type=int, required=True, help="Number of environments to visualize")
     parser.add_argument("--n-mc-envs", type=int, required=True, help="Number of MC environments to visualize")
     args = parser.parse_args()
@@ -198,7 +235,6 @@ def main():
     all_costs_per_env = np.stack(all_costs_per_env, axis=0)
     all_current_c_dists = np.stack(all_current_c_dists, axis=0)
 
-
     n_iterations = len(iterations)
     assert all_mc_grad_c.shape == (n_iterations, n_envs, ACTION_DIM)
     assert all_c.shape == (n_iterations, n_envs, ACTION_DIM)
@@ -216,14 +252,24 @@ def main():
         env_c = all_c[:, env_idx]
         env_c_perturbed = all_c_perturbed[:, :, env_idx]
         env_x_star_face = all_x_star[:, env_idx]
-        env_chosen_face = np.argmax(env_x_star_face, axis=1)
+        env_chosen_face = np.argmax(env_x_star_face[:, :NUM_FACES], axis=1)
         env_costs_per_env = all_costs_per_env[:, :, env_idx]
         env_current_c_dists = all_current_c_dists[:, env_idx]
+        env_x_perturbed = all_x_perturbed[:, :, env_idx]
         base_path = backward_dir.parent / f"grad_c__env_{env_idx}"
 
-        # plot_c_and_grads(iterations, env_c, env_grad_c_face, env_chosen_face, f"{base_path}.png")
+        plot_c_and_grads(iterations, env_c, env_grad_c_face, env_chosen_face, f"{base_path}.png")
         plot_c_and_grads_by_face(
-            iterations=iterations, c_env=env_c, c_env_perturbed=env_c_perturbed, c_env_cost=env_current_c_dists, c_env_perturbed_costs=env_costs_per_env, mc_grad_c=env_grad_c_face, n_mc_envs=n_mc_envs, save_path=f"{base_path}__per_face.png"
+            iterations=iterations,
+            c_env=env_c,
+            c_env_perturbed=env_c_perturbed,
+            c_env_cost=env_current_c_dists,
+            c_env_perturbed_costs=env_costs_per_env,
+            mc_grad_c=env_grad_c_face,
+            n_mc_envs=n_mc_envs,
+            save_path=f"{base_path}__per_face.png",
+            x_perturbed=env_x_perturbed,
+            env_chosen_face=env_chosen_face,
         )
 
     print(f"Saved plots for environment {env_idx}")

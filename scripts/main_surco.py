@@ -241,23 +241,18 @@ def _run_rollout(
     jpos_traj = jnp.concatenate(jpos_traj_parts, axis=1)
     return jnp.nanmean(t_distances[:, -1]), t_distances, jpos_traj
 
+
 def calculate_action_cost(x_star: jnp.ndarray, data, env: PushTEnv) -> jnp.ndarray:
-    """Calculate the cost of the action x_star.
-    """
+    """Calculate the cost of the action x_star."""
     n_envs = x_star.shape[0]
     n_actions = x_star.shape[1] // ACTION_DIM
     x_star_blocks = x_star.reshape(n_envs, n_actions, ACTION_DIM)
     face_weights = x_star_blocks[:, :, :NUM_FACES]
     contact_point = x_star_blocks[:, :, NUM_FACES]
     angle = x_star_blocks[:, :, NUM_FACES + 1]
-    _, t_dists, _ = _run_rollout(
-        face_weights=face_weights,
-        cp=contact_point,
-        ang=angle,
-        data=data,
-        env=env
-    )
+    _, t_dists, _ = _run_rollout(face_weights=face_weights, cp=contact_point, ang=angle, data=data, env=env)
     return t_dists[:, -1]
+
 
 def _n_actions(action_dim: int) -> int:
     if action_dim % ACTION_DIM != 0:
@@ -486,9 +481,6 @@ def _milp_backward(res, grad_x):
 milp_solver.defvjp(_milp_forward, _milp_backward)
 
 
-
-
-
 @dataclass
 class TrainingState:
     iteration_json_path: Path
@@ -635,6 +627,7 @@ def main(
 
     if use_wandb:
         import wandb
+
         cfg = dict(
             continuous_grad_from_mc=USE_MC_FOR_CONTINUOUS_GRADIENTS,
             n_envs=n_envs,
