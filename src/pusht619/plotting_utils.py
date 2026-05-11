@@ -285,7 +285,8 @@ def plot_rollout(
     save_filepath=None,
 ):
     """Plots the before and after for every T, pusher's initial position, and an arrow showing T movement."""
-    fig, ax = plt.subplots(figsize=(10, 10))
+    from pusht619.core import get_t_and_target_corners
+    import numpy as np
 
     n_envs = t_poses_initial.shape[0]
 
@@ -297,23 +298,43 @@ def plot_rollout(
                 single_target = False
                 break
 
-    # Plot target T(s)
     if single_target:
-        _, target_corners = get_t_and_target_corners(np.array([t_poses_initial[0]]), np.array([target_poses[0]]))
-        tgt_poly = plt.Polygon(
-            target_corners[0],
-            closed=True,
-            fill=True,
-            facecolor="green",
-            alpha=0.3,
-            edgecolor="green",
-            linestyle="--",
-            linewidth=2,
-        )
-        ax.add_patch(tgt_poly)
+        fig, ax = plt.subplots(figsize=(10, 10))
+        axes = [ax]
+        envs_to_plot = [list(range(min(n_envs, 9)))]
     else:
-        for i in range(n_envs):
-            _, target_corners = get_t_and_target_corners(np.array([t_poses_initial[i]]), np.array([target_poses[i]]))
+        n_plots = min(n_envs, 9)
+        if n_plots == 1:
+            rows, cols = 1, 1
+            figsize = (10, 10)
+        elif n_plots == 2:
+            rows, cols = 1, 2
+            figsize = (16, 8)
+        elif n_plots <= 4:
+            rows, cols = 2, 2
+            figsize = (16, 16)
+        else:
+            rows, cols = 3, 3
+            figsize = (20, 20)
+
+        fig, axes = plt.subplots(rows, cols, figsize=figsize)
+        if isinstance(axes, np.ndarray):
+            axes = axes.flatten()
+        else:
+            axes = [axes]
+        envs_to_plot = [[i] for i in range(n_plots)]
+
+        # Hide unused subplots
+        for i in range(n_plots, len(axes)):
+            axes[i].set_visible(False)
+
+    for plot_idx, env_indices in enumerate(envs_to_plot):
+        ax = axes[plot_idx]
+        all_pts = []
+
+        # Plot target T(s)
+        if single_target:
+            _, target_corners = get_t_and_target_corners(np.array([t_poses_initial[0]]), np.array([target_poses[0]]))
             tgt_poly = plt.Polygon(
                 target_corners[0],
                 closed=True,
@@ -325,76 +346,91 @@ def plot_rollout(
                 linewidth=2,
             )
             ax.add_patch(tgt_poly)
-
-    # Plot initial and final Ts, pushers, and arrows
-    all_pts = []
-    if single_target:
-        _, target_corners = get_t_and_target_corners(np.array([t_poses_initial[0]]), np.array([target_poses[0]]))
-        all_pts.append(target_corners[0])
-    else:
-        for i in range(n_envs):
-            _, target_corners = get_t_and_target_corners(np.array([t_poses_initial[i]]), np.array([target_poses[i]]))
             all_pts.append(target_corners[0])
+        else:
+            for i in env_indices:
+                _, target_corners = get_t_and_target_corners(
+                    np.array([t_poses_initial[i]]), np.array([target_poses[i]])
+                )
+                tgt_poly = plt.Polygon(
+                    target_corners[0],
+                    closed=True,
+                    fill=True,
+                    facecolor="green",
+                    alpha=0.3,
+                    edgecolor="green",
+                    linestyle="--",
+                    linewidth=2,
+                )
+                ax.add_patch(tgt_poly)
+                all_pts.append(target_corners[0])
 
-    for i in range(n_envs):
-        # Initial T
-        t_corners_initial, _ = get_t_and_target_corners(np.array([t_poses_initial[i]]), np.array([target_poses[i]]))
-        t_poly_initial = plt.Polygon(
-            t_corners_initial[0], closed=True, fill=True, facecolor="orange", alpha=0.3, edgecolor="darkorange"
-        )
-        ax.add_patch(t_poly_initial)
-        all_pts.append(t_corners_initial[0])
+        for i in env_indices:
+            # Initial T
+            t_corners_initial, _ = get_t_and_target_corners(np.array([t_poses_initial[i]]), np.array([target_poses[i]]))
+            t_poly_initial = plt.Polygon(
+                t_corners_initial[0], closed=True, fill=True, facecolor="orange", alpha=0.3, edgecolor="darkorange"
+            )
+            ax.add_patch(t_poly_initial)
+            all_pts.append(t_corners_initial[0])
 
-        # Final T
-        t_corners_final, _ = get_t_and_target_corners(np.array([t_poses_final[i]]), np.array([target_poses[i]]))
-        t_poly_final = plt.Polygon(
-            t_corners_final[0], closed=True, fill=True, facecolor="orange", alpha=0.8, edgecolor="darkorange"
-        )
-        ax.add_patch(t_poly_final)
-        all_pts.append(t_corners_final[0])
+            # Final T
+            t_corners_final, _ = get_t_and_target_corners(np.array([t_poses_final[i]]), np.array([target_poses[i]]))
+            t_poly_final = plt.Polygon(
+                t_corners_final[0], closed=True, fill=True, facecolor="orange", alpha=0.8, edgecolor="darkorange"
+            )
+            ax.add_patch(t_poly_final)
+            all_pts.append(t_corners_final[0])
 
-        # Pusher initial position
-        ax.scatter(
-            pusher_initial_positions[i, 0],
-            pusher_initial_positions[i, 1],
-            color="blue",
-            marker="o",
-            s=50,
-            label="Pusher Initial" if i == 0 else "",
-        )
-        all_pts.append(pusher_initial_positions[i : i + 1])
+            # Pusher initial position
+            ax.scatter(
+                pusher_initial_positions[i, 0],
+                pusher_initial_positions[i, 1],
+                color="blue",
+                marker="o",
+                s=50,
+                label="Pusher Initial" if plot_idx == 0 and i == env_indices[0] else "",
+            )
+            all_pts.append(pusher_initial_positions[i : i + 1])
 
-        # Arrow from initial to final T center
-        ax.arrow(
-            t_poses_initial[i, 0],
-            t_poses_initial[i, 1],
-            t_poses_final[i, 0] - t_poses_initial[i, 0],
-            t_poses_final[i, 1] - t_poses_initial[i, 1],
-            head_width=0.02,
-            head_length=0.03,
-            fc="black",
-            ec="black",
-            alpha=0.5,
-            length_includes_head=True,
-        )
+            # Arrow from initial to final T center
+            ax.arrow(
+                t_poses_initial[i, 0],
+                t_poses_initial[i, 1],
+                t_poses_final[i, 0] - t_poses_initial[i, 0],
+                t_poses_final[i, 1] - t_poses_initial[i, 1],
+                head_width=0.02,
+                head_length=0.03,
+                fc="black",
+                ec="black",
+                alpha=0.5,
+                length_includes_head=True,
+            )
 
-    # Set limits based on all points
-    all_pts_arr = np.vstack(all_pts)
-    min_x, min_y = np.min(all_pts_arr, axis=0) - 0.1
-    max_x, max_y = np.max(all_pts_arr, axis=0) + 0.1
-    ax.set_xlim(min_x, max_x)
-    ax.set_ylim(min_y, max_y)
+        # Set limits based on all points
+        if all_pts:
+            all_pts_arr = np.vstack(all_pts)
+            min_x, min_y = np.min(all_pts_arr, axis=0) - 0.1
+            max_x, max_y = np.max(all_pts_arr, axis=0) + 0.1
+            ax.set_xlim(min_x, max_x)
+            ax.set_ylim(min_y, max_y)
 
-    ax.set_aspect("equal")
-    ax.set_title("Rollout Visualization (Before & After)")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
+        ax.set_aspect("equal")
+        if single_target:
+            ax.set_title("Rollout Visualization (Before & After)")
+        else:
+            ax.set_title(f"Env {env_indices[0]}")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
 
-    # Avoid duplicate labels in legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    if by_label:
-        ax.legend(by_label.values(), by_label.keys())
+        # Avoid duplicate labels in legend
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        if by_label:
+            ax.legend(by_label.values(), by_label.keys())
+
+    if not single_target:
+        fig.suptitle("Rollout Visualization (Before & After)", fontsize=16)
 
     fig.tight_layout()
     if save_filepath is None:
