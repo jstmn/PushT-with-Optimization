@@ -67,7 +67,7 @@ RANDOM_MODE="random-spawn__random-target" # hardest
 # Random mode examples
 python scripts/main_surco.py --n-envs 1  --verbosity 1 --random-mode ${RANDOM_MODE} --record-video
 python scripts/main_surco.py --n-envs 2  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --no-wandb --optimizer sgd
-python scripts/main_surco.py --n-envs 2  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
+python scripts/main_surco.py --n-envs 4  --verbosity 1 --random-mode ${RANDOM_MODE} --lr 0.05 --optimizer sgd
 python scripts/main_surco.py --n-envs 32 --verbosity 1 --random-mode ${RANDOM_MODE}
 """
 
@@ -98,7 +98,10 @@ from pusht619.plotting_utils import plot_results, plot_perturbation_hist, plot_n
 
 _CP_LO, _CP_HI = CONTACT_POINT_BOUNDS
 _ANG_LO, _ANG_HI = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
-
+_CP_MID = 0.5 * (_CP_LO + _CP_HI)
+_ANG_MID = 0.5 * (_ANG_LO + _ANG_HI)
+_CP_SCALE = _CP_HI - _CP_LO
+_ANG_SCALE = _ANG_HI - _ANG_LO
 
 class SurCoMLP(nn.Module):
     """Maps context y → solver parameters c (face logits + bounded cp/angle targets).
@@ -120,6 +123,10 @@ class SurCoMLP(nn.Module):
             x = nn.leaky_relu(x)
         x = nn.Dense(self.output_dim)(x)
         x = x.reshape(x.shape[0], -1, NUM_FACES + 2)
+
+        # Shift continuous values to the center of their bounds
+        x = x.at[:, :, NUM_FACES].add(_CP_MID)
+        x = x.at[:, :, NUM_FACES + 1].add(_ANG_MID)
         return x.reshape(x.shape[0], -1)
 
 
@@ -162,10 +169,6 @@ BASELINE_EVAL_EVERY = 5
 _SOLVER = ActionSolver()
 _ENV: PushTEnv | None = None
 _ENV_BACKWARD: PushTEnv | None = None
-_CP_MID = 0.5 * (CONTACT_POINT_BOUNDS[0] + CONTACT_POINT_BOUNDS[1])
-_ANG_MID = 0.5 * (float(ANGLE_BOUNDS[0]) + float(ANGLE_BOUNDS[1]))
-_CP_SCALE = CONTACT_POINT_BOUNDS[1] - CONTACT_POINT_BOUNDS[0]
-_ANG_SCALE = float(ANGLE_BOUNDS[1]) - float(ANGLE_BOUNDS[0])
 
 _BACKWARD_LOG_DIR: Path | None = None
 _CURRENT_ITERATION: int = -1
@@ -896,7 +899,6 @@ def main(
         
         if verbosity > 0:
             cprint(f"|____ mean_dist_change: {mean_dist_delta * 100:.3f} [cm]", "green" if mean_dist_delta < 0 else "red")
-        if verbosity > 1:
             print(f"|____ dist_deltas_np=\n{dist_deltas_np}")
         cprint(
             f"|____ timing  fwd+bwd: {t_forward_backward * 1000:.0f} ms  "
