@@ -96,6 +96,7 @@ from pusht619.models import ActionSolver, ActionSolverMultiStep
 from pusht619.core import Action, PushTEnv, ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES, CONTEXT_DIM_RELATIVE
 from pusht619.plotting_utils import plot_results, plot_perturbation_hist, plot_network_output_hist, plot_rollout
 
+MLP_HIDDEN_DIMS = (128, 128)
 _CP_LO, _CP_HI = CONTACT_POINT_BOUNDS
 _ANG_LO, _ANG_HI = float(ANGLE_BOUNDS[0]), float(ANGLE_BOUNDS[1])
 _CP_MID = 0.5 * (_CP_LO + _CP_HI)
@@ -631,10 +632,11 @@ def main(
                 iterations_dir=iterations_dir,
                 backward_dir=backward_dir,
                 optimizer=optimizer_type,
+                mlp_hidden_dims=MLP_HIDDEN_DIMS,
             ),
         )
 
-    mlp = SurCoMLP(hidden_dims=(128, 128), output_dim=solver_output_dim)
+    mlp = SurCoMLP(hidden_dims=MLP_HIDDEN_DIMS, output_dim=solver_output_dim)
     params = mlp.init(jax.random.PRNGKey(0), jnp.zeros((1, CONTEXT_DIM_RELATIVE)))
 
     if optimizer_type == "sgd":
