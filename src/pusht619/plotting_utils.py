@@ -1,93 +1,49 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 from pusht619.core import ANGLE_BOUNDS, CONTACT_POINT_BOUNDS, NUM_FACES
+from pusht619.core import get_t_and_target_corners, T_CORNERS, FACE_START_POINTS, FACE_END_POINTS
 
 
 def plot_results(
-    save_dir,
-    means,
-    stds,
-    dist_delta_hist,
+    dist_change_hist,
     face_hist,
     cp_hist,
     ang_hist,
     n_envs,
-    n_sim_steps,
     n_opt_steps,
     random_mode: str,
     m_rollouts: int,
     perturb_lambda: float,
-    relative_coordinates: bool = False,
-    random_means=None,
-    random_stds=None,
-    baseline_iters=None,
+    relative_coordinates: bool,
     save_filepath=None,
     save_filepath2=None,
     open_after_save=False,
 ):
-    initial_mean_loss = means[0]
-    x_iters = np.arange(len(means))
-    has_random_baseline = random_means is not None and random_stds is not None
-    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     fig.suptitle(
         f"SurCo-prior  n_envs={n_envs}  "
         f"n_opt_steps={n_opt_steps}  M={m_rollouts}  λ={perturb_lambda}  "
         f"RANDOM_MODE={random_mode}  RELATIVE_COORDINATES={relative_coordinates}",
         fontweight="bold",
     )
-    ax_mean, ax_std = axes[0, 0], axes[0, 1]
-    ax_cp, ax_ang = axes[1, 0], axes[1, 1]
-    ax_face, ax_delta = axes[2, 0], axes[2, 1]
+    ax_cp, ax_ang = axes[0, 0], axes[0, 1]
+    ax_face, ax_dist = axes[1, 0], axes[1, 1]
     n_envs_max = min(n_envs, 7)
 
-    ax_mean.axhline(float(initial_mean_loss), label="initial mean", color="black", linestyle="--")
-    ax_mean.plot(x_iters, means, label="training mean", color="tab:red")
-    ax_mean.legend()
-    ax_mean.set_title("Mean Final Distance")
-    ax_mean.set_xlabel("Iteration")
-    ax_mean.set_ylabel("Distance [m]")
-    ax_mean.grid(True, alpha=0.3)
-
-    if has_random_baseline:
-        bx = np.asarray(baseline_iters) if baseline_iters is not None else np.arange(len(random_means))
-        ax_std.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-        ax_std.plot(bx, random_means, label="mean % vs baseline", color="tab:green")
-        ax_std.fill_between(
-            bx,
-            np.asarray(random_means) - np.asarray(random_stds),
-            np.asarray(random_means) + np.asarray(random_stds),
-            color="tab:green",
-            alpha=0.2,
-            label="± std across envs",
-        )
-        ax_std.legend()
-        ax_std.set_title("% vs Center-Action Baseline")
-        ax_std.set_xlabel("Iteration")
-        ax_std.set_ylabel("% change (negative = better)")
-    else:
-        ax_std.plot(x_iters, stds, label="training std", color="tab:red")
-        ax_std.legend()
-        ax_std.set_title("Final Distance Std")
-        ax_std.set_xlabel("Iteration")
-        ax_std.set_ylabel("Std [m]")
-    ax_std.grid(True, alpha=0.3)
-
-    mean_delta = [float(np.nanmean(delta)) for delta in dist_delta_hist]
-    ax_delta.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-    ax_delta.plot(mean_delta, color="black", linewidth=2.0, label="mean")
+    mean_dist_change = [float(np.mean(dists)) for dists in dist_change_hist]
+    ax_dist.plot(mean_dist_change, color="black", linewidth=2.0, label="mean")
     for env_idx in range(n_envs_max):
-        ax_delta.plot([delta[env_idx] for delta in dist_delta_hist], label=f"env {env_idx}", alpha=0.8)
-    ax_delta.legend()
-    ax_delta.set_title("Distance Change Per Env")
-    ax_delta.set_xlabel("Iteration")
-    ax_delta.set_ylabel("Delta from Iter 1 [m]")
-    ax_delta.grid(True, alpha=0.3)
+        ax_dist.plot([dists[env_idx] for dists in dist_change_hist], label=f"env {env_idx}", alpha=0.8)
+    ax_dist.legend()
+    ax_dist.set_title("Distance Change Per Env during rollout (Final - Initial)")
+    ax_dist.set_xlabel("Iteration")
+    ax_dist.set_ylabel("Distance Change [cm]")
+    ax_dist.grid(True, alpha=0.3)
 
     for env_idx in range(n_envs_max):
         x1 = np.arange(len(cp_hist))
@@ -124,12 +80,11 @@ def plot_results(
     ax_face.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    if save_filepath is None:
-        save_filepath = save_dir / "surco_prior.png"
     plt.savefig(save_filepath, bbox_inches="tight")
+    print(f"Saved plot to {save_filepath}")
     if save_filepath2 is not None:
         plt.savefig(save_filepath2, bbox_inches="tight")
-    print(f"Saved plot to {save_filepath}")
+        print(f"Saved plot to {save_filepath2}")
     plt.close()
     if open_after_save:
         print(f"xdg-open {save_filepath}")
@@ -264,3 +219,246 @@ def plot_network_output_hist(
 
     fig.tight_layout()
     return fig
+
+
+def draw_scene_visualization(ax_scene, t_pose, target_pose):
+    """Draws the T block, target T block, and face labels on the given axes."""
+    t_corners, target_corners = get_t_and_target_corners(np.array([t_pose]), np.array([target_pose]))
+
+    # Plot target T (green)
+    tgt_poly = plt.Polygon(
+        target_corners[0], closed=True, fill=True, facecolor="green", alpha=0.3, edgecolor="green", linestyle="--"
+    )
+    ax_scene.add_patch(tgt_poly)
+
+    # Plot T (orange)
+    t_poly = plt.Polygon(t_corners[0], closed=True, fill=True, facecolor="orange", alpha=0.7, edgecolor="darkorange")
+    ax_scene.add_patch(t_poly)
+
+    # Add face labels to the T block
+    for face_idx in range(NUM_FACES):
+        # Find the indices of the start and end points in T_CORNERS
+        start_idx = np.where(np.all(T_CORNERS == FACE_START_POINTS[face_idx], axis=1))[0][0]
+        end_idx = np.where(np.all(T_CORNERS == FACE_END_POINTS[face_idx], axis=1))[0][0]
+        p_start = t_corners[0, start_idx]
+        p_end = t_corners[0, end_idx]
+        midpoint = (p_start + p_end) / 2
+
+        # Add a small offset outward for the text
+        normal = np.array([-(p_end[1] - p_start[1]), p_end[0] - p_start[0]])
+        normal = normal / np.linalg.norm(normal)
+        text_pos = midpoint + normal * 0.02
+
+        ax_scene.text(
+            text_pos[0],
+            text_pos[1],
+            f"Face {face_idx}",
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=1),
+        )
+
+        # Draw a line highlighting the face
+        ax_scene.plot([p_start[0], p_end[0]], [p_start[1], p_end[1]], "r-", linewidth=2)
+
+    ax_scene.set_aspect("equal")
+    ax_scene.set_title("Scene Visualization")
+    ax_scene.set_xlabel("X")
+    ax_scene.set_ylabel("Y")
+
+    # Set limits based on the block positions
+    all_pts = np.vstack([t_corners[0], target_corners[0]])
+    min_x, min_y = np.min(all_pts, axis=0) - 0.1
+    max_x, max_y = np.max(all_pts, axis=0) + 0.1
+    ax_scene.set_xlim(min_x, max_x)
+    ax_scene.set_ylim(min_y, max_y)
+
+
+def plot_rollout(
+    save_dir,
+    t_poses_initial,
+    t_poses_final,
+    target_poses,
+    pusher_initial_positions,
+    save_filepath=None,
+):
+    """Plots the before and after for every T, pusher's initial position, and an arrow showing T movement."""
+    from pusht619.core import get_t_and_target_corners, NUM_FACES, T_CORNERS, FACE_START_POINTS, FACE_END_POINTS
+    import numpy as np
+
+    n_envs = t_poses_initial.shape[0]
+
+    # Check if there's a single target T (all target poses are the same)
+    single_target = True
+    if n_envs > 1:
+        for i in range(1, n_envs):
+            if not np.allclose(target_poses[0], target_poses[i]):
+                single_target = False
+                break
+
+    if single_target:
+        fig, ax = plt.subplots(figsize=(10, 10))
+        axes = [ax]
+        envs_to_plot = [list(range(min(n_envs, 9)))]
+    else:
+        n_plots = min(n_envs, 9)
+        if n_plots == 1:
+            rows, cols = 1, 1
+            figsize = (10, 10)
+        elif n_plots == 2:
+            rows, cols = 1, 2
+            figsize = (16, 8)
+        elif n_plots <= 4:
+            rows, cols = 2, 2
+            figsize = (16, 16)
+        else:
+            rows, cols = 3, 3
+            figsize = (20, 20)
+
+        fig, axes = plt.subplots(rows, cols, figsize=figsize)
+        if isinstance(axes, np.ndarray):
+            axes = axes.flatten()
+        else:
+            axes = [axes]
+        envs_to_plot = [[i] for i in range(n_plots)]
+
+        # Hide unused subplots
+        for i in range(n_plots, len(axes)):
+            axes[i].set_visible(False)
+
+    for plot_idx, env_indices in enumerate(envs_to_plot):
+        ax = axes[plot_idx]
+        all_pts = []
+
+        # Plot target T(s)
+        if single_target:
+            _, target_corners = get_t_and_target_corners(np.array([t_poses_initial[0]]), np.array([target_poses[0]]))
+            tgt_poly = plt.Polygon(
+                target_corners[0],
+                closed=True,
+                fill=True,
+                facecolor="green",
+                alpha=0.3,
+                edgecolor="green",
+                linestyle="--",
+                linewidth=2,
+            )
+            ax.add_patch(tgt_poly)
+            all_pts.append(target_corners[0])
+        else:
+            for i in env_indices:
+                _, target_corners = get_t_and_target_corners(
+                    np.array([t_poses_initial[i]]), np.array([target_poses[i]])
+                )
+                tgt_poly = plt.Polygon(
+                    target_corners[0],
+                    closed=True,
+                    fill=True,
+                    facecolor="green",
+                    alpha=0.3,
+                    edgecolor="green",
+                    linestyle="--",
+                    linewidth=2,
+                )
+                ax.add_patch(tgt_poly)
+                all_pts.append(target_corners[0])
+
+        for i in env_indices:
+            # Initial T
+            t_corners_initial, _ = get_t_and_target_corners(np.array([t_poses_initial[i]]), np.array([target_poses[i]]))
+            t_poly_initial = plt.Polygon(
+                t_corners_initial[0], closed=True, fill=True, facecolor="orange", alpha=0.3, edgecolor="darkorange"
+            )
+            ax.add_patch(t_poly_initial)
+            all_pts.append(t_corners_initial[0])
+
+            # Label the environment
+            t_center = np.mean(t_corners_initial[0], axis=0)
+            ax.text(t_center[0], t_center[1], f"Env {i}", ha="center", va="center", fontsize=8, fontweight="bold")
+
+            # Label the faces
+            for face_idx in range(NUM_FACES):
+                start_idx = np.where(np.all(T_CORNERS == FACE_START_POINTS[face_idx], axis=1))[0][0]
+                end_idx = np.where(np.all(T_CORNERS == FACE_END_POINTS[face_idx], axis=1))[0][0]
+                p_start = t_corners_initial[0, start_idx]
+                p_end = t_corners_initial[0, end_idx]
+                midpoint = (p_start + p_end) / 2
+                normal = np.array([-(p_end[1] - p_start[1]), p_end[0] - p_start[0]])
+                normal = normal / np.linalg.norm(normal)
+                text_pos = midpoint + normal * 0.02
+                ax.text(
+                    text_pos[0],
+                    text_pos[1],
+                    str(face_idx),
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    bbox=dict(facecolor="white", alpha=0.5, edgecolor="none", pad=0.5),
+                )
+
+            # Final T
+            t_corners_final, _ = get_t_and_target_corners(np.array([t_poses_final[i]]), np.array([target_poses[i]]))
+            t_poly_final = plt.Polygon(
+                t_corners_final[0], closed=True, fill=True, facecolor="orange", alpha=0.8, edgecolor="darkorange"
+            )
+            ax.add_patch(t_poly_final)
+            all_pts.append(t_corners_final[0])
+
+            # Pusher initial position
+            ax.scatter(
+                pusher_initial_positions[i, 0],
+                pusher_initial_positions[i, 1],
+                color="blue",
+                marker="o",
+                s=50,
+                label="Pusher Initial" if plot_idx == 0 and i == env_indices[0] else "",
+            )
+            all_pts.append(pusher_initial_positions[i : i + 1])
+
+            # Arrow from initial to final T center
+            ax.arrow(
+                t_poses_initial[i, 0],
+                t_poses_initial[i, 1],
+                t_poses_final[i, 0] - t_poses_initial[i, 0],
+                t_poses_final[i, 1] - t_poses_initial[i, 1],
+                head_width=0.02,
+                head_length=0.03,
+                fc="black",
+                ec="black",
+                alpha=0.5,
+                length_includes_head=True,
+            )
+
+        # Set limits based on all points
+        if all_pts:
+            all_pts_arr = np.vstack(all_pts)
+            min_x, min_y = np.min(all_pts_arr, axis=0) - 0.1
+            max_x, max_y = np.max(all_pts_arr, axis=0) + 0.1
+            ax.set_xlim(min_x, max_x)
+            ax.set_ylim(min_y, max_y)
+
+        ax.set_aspect("equal")
+        if single_target:
+            ax.set_title("Rollout Visualization (Before & After)")
+        else:
+            ax.set_title(f"Env {env_indices[0]}")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+
+        # Avoid duplicate labels in legend
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        if by_label:
+            ax.legend(by_label.values(), by_label.keys())
+
+    if not single_target:
+        fig.suptitle("Rollout Visualization (Before & After)", fontsize=16)
+
+    fig.tight_layout()
+    if save_filepath is None:
+        save_filepath = save_dir / "rollout_visualization.png"
+    plt.savefig(save_filepath, bbox_inches="tight")
+    print(f"Saved rollout plot to {save_filepath}")
+    plt.close(fig)
